@@ -1,0 +1,2584 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>wavesync — 超音波檔案傳輸</title>
+<style>
+:root {
+  --bg: #ffffff; --fg: #18181b; --muted: #71717a;
+  --card: #fafafa; --line: #e4e4e7; --grid: #a1a1aa; --accent: #2563eb;
+  --ok: #16a34a; --warn: #ca8a04; --bad: #dc2626;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0b0b0e; --fg: #ededf0; --muted: #9b9ba4;
+    --card: #16161b; --line: #2a2a32; --grid: #6b6b76; --accent: #60a5fa;
+    --ok: #4ade80; --warn: #facc15; --bad: #f87171;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0 auto; padding: 20px 16px 64px; max-width: 860px;
+  background: var(--bg); color: var(--fg);
+  font: 15px/1.6 system-ui, -apple-system, "Noto Sans TC", sans-serif;
+  -webkit-text-size-adjust: 100%;
+}
+h1 { font-size: 22px; margin: 0 0 2px; letter-spacing: -0.01em; }
+h1 span { color: var(--muted); font-weight: 400; }
+h2 { font-size: 14px; margin: 0 0 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; }
+.sub { margin: 0 0 22px; color: var(--muted); }
+.card {
+  background: var(--card); border: 1px solid var(--line);
+  border-radius: 12px; padding: 16px; margin-bottom: 14px;
+}
+.radios { display: flex; flex-wrap: wrap; gap: 8px 20px; }
+.radios label { display: flex; align-items: center; gap: 7px; cursor: pointer; }
+.hint { color: var(--muted); font-size: 13px; margin: 10px 0 0; }
+.btns { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+button, .btn {
+  font: inherit; font-size: 14px; padding: 9px 16px; border-radius: 8px;
+  border: 1px solid transparent; background: var(--accent); color: #fff;
+  cursor: pointer; text-decoration: none; display: inline-block;
+}
+button:disabled { opacity: 0.4; cursor: default; }
+button.ghost, .btn.ghost { background: transparent; color: var(--fg); border-color: var(--line); }
+
+.diag { display: grid; gap: 4px; }
+.drow { display: flex; justify-content: space-between; gap: 12px; font-size: 13px; }
+.drow span { color: var(--muted); }
+.drow b { font-weight: 500; text-align: right; }
+.drow.ok b { color: var(--ok); }
+.drow.warn b { color: var(--warn); }
+.drow.bad b { color: var(--bad); }
+.drow.info b { color: var(--muted); font-weight: 400; word-break: break-all; }
+
+.help {
+  margin-top: 12px; padding: 12px; border-radius: 8px; font-size: 13px;
+  border: 1px solid var(--bad); background: color-mix(in srgb, var(--bad) 8%, transparent);
+}
+.help p { margin: 8px 0 4px; }
+.help ol { margin: 0; padding-left: 20px; }
+.help li { margin-bottom: 6px; }
+.help code { font: 12px ui-monospace, Consolas, monospace; word-break: break-all; }
+
+canvas { width: 100%; height: 320px; display: block; margin-top: 10px; }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; color: var(--muted); margin-top: 4px; }
+.legend span { display: flex; align-items: center; gap: 5px; }
+.legend i { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+
+textarea#summary {
+  width: 100%; margin-top: 10px; padding: 10px; border-radius: 8px; resize: vertical;
+  border: 1px solid var(--line); background: var(--bg); color: var(--fg);
+  font: 12px/1.5 ui-monospace, "Cascadia Mono", Consolas, monospace;
+}
+pre#log {
+  margin: 0; max-height: 340px; overflow: auto; white-space: pre-wrap; word-break: break-all;
+  font: 12px/1.5 ui-monospace, "Cascadia Mono", Consolas, monospace; color: var(--fg);
+}
+
+.progress { height: 8px; background: var(--line); border-radius: 4px; overflow: hidden; margin: 12px 0 4px; }
+.progress i { display: block; height: 100%; width: 0; background: var(--accent); transition: width 0.3s; }
+.progress i.bad { background: var(--bad); }
+input[type=file] { font: inherit; font-size: 14px; color: var(--fg); max-width: 100%; }
+
+input[type=password] {
+  width: 100%; padding: 9px 12px; border-radius: 8px; font: inherit; font-size: 15px;
+  border: 1px solid var(--line); background: var(--bg); color: var(--fg);
+}
+</style>
+
+</head>
+<body>
+<h1>wavesync</h1>
+<p class="sub">用聲音把檔案從一台裝置送到另一台。無網路、無配對、無伺服器。</p>
+
+<section class="card">
+  <h2>環境</h2>
+  <div id="diag" class="diag"></div>
+</section>
+
+<section class="card">
+  <h2>1. 角色</h2>
+  <div class="radios">
+    <label><input type="radio" name="role" value="send" checked> 傳送</label>
+    <label><input type="radio" name="role" value="recv"> 接收</label>
+  </div>
+  <p class="hint">兩台裝置一台選傳送、一台選接收。<b>手機要貼在喇叭上 2–3 cm</b>，麥克風端對準、墊軟布隔開桌面 —— 距離拉遠會因為房間混響而解不開。</p>
+</section>
+
+<section class="card">
+  <h2>2. 模式</h2>
+  <div class="radios">
+    <label><input type="radio" name="band" value="stealth" checked> Stealth 18–22 kHz（無聲）</label>
+    <label><input type="radio" name="band" value="turbo"> Turbo 2–22 kHz（很吵）</label>
+  </div>
+  <div class="radios" style="margin-top:10px">
+    <span style="color:var(--muted);font-size:13px">調變</span>
+    <label><input type="radio" name="mod" value="qpsk" checked> QPSK（快）</label>
+    <label><input type="radio" name="mod" value="bpsk"> BPSK（穩，速率減半）</label>
+  </div>
+  <div id="bandInfo" class="diag" style="margin-top:10px"></div>
+  <p class="hint">兩端必須選同一個（模式與調變都是）。Stealth 幾乎沒人聽得見；Turbo 快 5 倍但聲音像數據機撥號。
+  BPSK 的門檻比 QPSK 低 4.8 dB —— 若為了避免可聽的互調失真而必須把輸出調得很低，改用 BPSK 才撐得住。</p>
+</section>
+
+<section class="card">
+  <h2>3. 密碼</h2>
+  <input type="password" id="pw" placeholder="兩端必須輸入相同的密碼" autocomplete="off" spellcheck="false">
+  <p class="hint">檔案會用這個密碼加密（PBKDF2-SHA256 210k 迭代 → AES-256-GCM），檔名也一起加密。
+  沒有密碼的人即使錄下全部音訊也解不出內容。</p>
+  <p class="hint"><b>這不是「輸入密碼才能開啟網頁」的那種閘門</b> —— 這是公開的靜態網頁，
+  任何前端閘門的密碼都寫在原始碼裡，看原始碼或關掉 JS 就能繞過，等於零安全性。
+  真正有效的是加密內容本身，所以我做的是後者。</p>
+</section>
+
+<section class="card" id="sendPanel">
+  <h2>4. 傳送</h2>
+  <input type="file" id="picker">
+  <div class="radios" style="margin-top:10px">
+    <span style="color:var(--muted);font-size:13px">輸出增益</span>
+    <label><input type="radio" name="txgain" value="0"> 0 dB</label>
+    <label><input type="radio" name="txgain" value="-6" checked> −6 dB</label>
+    <label><input type="radio" name="txgain" value="-12"> −12 dB</label>
+    <label><input type="radio" name="txgain" value="-18"> −18 dB</label>
+  </div>
+  <p class="hint">Stealth 模式若還是聽得到聲音，把這個調低。原因是喇叭的二階互調把
+  18–22 kHz 之間任兩個副載波的差頻生到 0–4 kHz —— 降低驅動位準能讓峰值離開非線性區，
+  每降 1 dB，互調降約 2 dB。訊號已做過削峰處理，降 6 dB 後接收端的 SNR 幾乎不變。</p>
+  <p class="hint" id="fileInfo">尚未選擇檔案</p>
+  <div class="btns">
+    <button id="sendStart">開始傳送</button>
+    <button id="sendStop" disabled>停止</button>
+  </div>
+  <div id="txProgress" class="diag" style="margin-top:10px"></div>
+  <p class="hint">噴泉碼沒有「送完」的概念 —— 它會一直產生新封包，直到你按停止。接收端湊夠就會自己完成。</p>
+</section>
+
+<section class="card" id="recvPanel" hidden>
+  <h2>4. 接收</h2>
+  <div class="btns">
+    <button id="recvStart">開始接收</button>
+    <button id="recvStop" disabled>停止</button>
+  </div>
+  <div class="progress"><i id="bar"></i></div>
+  <div id="rxProgress" class="diag"></div>
+  <div class="btns"><a id="dlFile" class="btn" hidden download></a></div>
+  <p class="hint">可以在傳送開始之後才按接收 —— 每個訊框都自帶前導與檔案資訊，隨時可加入。</p>
+</section>
+
+<section class="card">
+  <h2>紀錄</h2>
+  <pre id="log"></pre>
+  <div class="btns"><button id="clearLog" class="ghost">清除</button></div>
+</section>
+
+<script>
+(function () {
+'use strict';
+// ═══ ../src/dsp/fft.js ═════════════════════════════════════════
+// 就地 radix-2 FFT，預先計算 twiddle 表以避免遞推累積誤差。
+class FFT {
+  constructor(n) {
+    if ((n & (n - 1)) !== 0 || n < 2) throw new Error('FFT size must be a power of 2');
+    this.n = n;
+    this.cos = new Float64Array(n / 2);
+    this.sin = new Float64Array(n / 2);
+    for (let i = 0; i < n / 2; i++) {
+      const ang = (-2 * Math.PI * i) / n;
+      this.cos[i] = Math.cos(ang);
+      this.sin[i] = Math.sin(ang);
+    }
+    this.rev = new Uint32Array(n);
+    let bits = 0;
+    while (1 << bits < n) bits++;
+    for (let i = 0; i < n; i++) {
+      let r = 0;
+      for (let b = 0; b < bits; b++) if (i & (1 << b)) r |= 1 << (bits - 1 - b);
+      this.rev[i] = r;
+    }
+  }
+
+  forward(re, im) {
+    const { n, rev, cos, sin } = this;
+    for (let i = 0; i < n; i++) {
+      const j = rev[i];
+      if (i < j) {
+        let t = re[i]; re[i] = re[j]; re[j] = t;
+        t = im[i]; im[i] = im[j]; im[j] = t;
+      }
+    }
+    for (let len = 2; len <= n; len <<= 1) {
+      const half = len >> 1;
+      const step = n / len;
+      for (let i = 0; i < n; i += len) {
+        for (let k = 0, tw = 0; k < half; k++, tw += step) {
+          const wr = cos[tw], wi = sin[tw];
+          const a = i + k, b = a + half;
+          const vr = re[b] * wr - im[b] * wi;
+          const vi = re[b] * wi + im[b] * wr;
+          re[b] = re[a] - vr; im[b] = im[a] - vi;
+          re[a] += vr;        im[a] += vi;
+        }
+      }
+    }
+  }
+
+  // 共軛 → forward → 共軛 → 1/N
+  inverse(re, im) {
+    const { n } = this;
+    for (let i = 0; i < n; i++) im[i] = -im[i];
+    this.forward(re, im);
+    const s = 1 / n;
+    for (let i = 0; i < n; i++) { re[i] *= s; im[i] = -im[i] * s; }
+  }
+}
+
+// 以 FFT 做循環相關：回傳 |correlation| 的平方，長度 nfft。
+// 用於 chirp 前導的匹配濾波 —— 直接時域相關在 4096 tap 下太慢。
+function correlateMagSq(signal, offset, len, template, nfft) {
+  const fft = new FFT(nfft);
+  const ar = new Float64Array(nfft), ai = new Float64Array(nfft);
+  const br = new Float64Array(nfft), bi = new Float64Array(nfft);
+  for (let i = 0; i < len && offset + i < signal.length; i++) ar[i] = signal[offset + i];
+  for (let i = 0; i < template.length; i++) br[i] = template[i];
+  fft.forward(ar, ai);
+  fft.forward(br, bi);
+  // A · conj(B)
+  for (let k = 0; k < nfft; k++) {
+    const rr = ar[k] * br[k] + ai[k] * bi[k];
+    const ii = ai[k] * br[k] - ar[k] * bi[k];
+    ar[k] = rr; ai[k] = ii;
+  }
+  fft.inverse(ar, ai);
+  const out = new Float64Array(nfft);
+  for (let k = 0; k < nfft; k++) out[k] = ar[k] * ar[k] + ai[k] * ai[k];
+  return out;
+}
+
+// ═══ ../src/dsp/interp.js ══════════════════════════════════════
+// 小數位置的 sinc 插值。
+//
+// 收發時脈差的補償靠它，而我們的頻帶頂端 22 kHz 已達 0.917 Nyquist ——
+// 過渡帶只剩 2 kHz（0.042·fs）。窗函數選錯會直接在那裡崩掉：
+// 原本用 32-tap Blackman，在 offset=0.5 時 20 kHz 尚有 63 dB，
+// 22 kHz 卻只剩 16.7 dB，接收端一開啟小數取樣就把頻帶頂端毀掉。
+//
+// 改用 Kaiser(β=8) 並加長到 64 tap。經驗式 N ≈ A/(22·Δf/fs)：
+// 60 dB 阻帶配 0.042 的過渡帶約需 65 tap。
+
+const TAPS = 64;
+const INTERP_HALF = TAPS / 2;
+const BETA = 8.0;
+
+function besselI0(x) {
+  let sum = 1, term = 1;
+  const h = (x * x) / 4;
+  for (let k = 1; k < 40; k++) {
+    term *= h / (k * k);
+    sum += term;
+    if (term < 1e-16 * sum) break;
+  }
+  return sum;
+}
+
+// 窗只跟 tap 序號有關，與小數位置無關，先算好
+const WIN = new Float64Array(TAPS);
+{
+  const denom = besselI0(BETA);
+  for (let i = 0; i < TAPS; i++) {
+    const r = (2 * i) / (TAPS - 1) - 1;
+    WIN[i] = besselI0(BETA * Math.sqrt(Math.max(0, 1 - r * r))) / denom;
+  }
+}
+
+function sincAt(x, pos) {
+  const i0 = Math.floor(pos);
+  const frac = pos - i0;
+  let acc = 0;
+  for (let t = -INTERP_HALF + 1, w = 0; t <= INTERP_HALF; t++, w++) {
+    const idx = i0 + t;
+    if (idx < 0 || idx >= x.length) continue;
+    const d = t - frac;
+    const s = Math.abs(d) < 1e-9 ? 1 : Math.sin(Math.PI * d) / (Math.PI * d);
+    acc += x[idx] * s * WIN[w];
+  }
+  return acc;
+}
+
+// out[n] = x[n·ratio]，不引入額外延遲
+function resample(x, ratio) {
+  const outLen = Math.floor((x.length - INTERP_HALF) / ratio);
+  const out = new Float32Array(Math.max(0, outLen));
+  for (let n = 0; n < out.length; n++) out[n] = sincAt(x, n * ratio);
+  return out;
+}
+
+// ═══ ../src/dsp/prng.js ════════════════════════════════════════
+// 固定種子的 xorshift32。收發兩端必須產生完全相同的 pilot 與 probe 序列，
+// 所以不能用 Math.random —— 這裡要的是可重現，不是隨機。
+/**
+ * 32-bit 整數雪崩混合（splitmix32 的 finalizer）。
+ *
+ * xorshift32 對「連續的小種子」極度不友善：seed=1 的第一個輸出只有 270305，
+ * 除以 2³² 得 6.3e-5 —— 拿去查機率分布會一律落在最小的那一格。
+ * 噴泉碼的封包序號正好就是 0,1,2,3…，不先打散的話所有封包都會拿到度數 1，
+ * 整個噴泉碼退化成隨機挑塊（實測解碼開銷從 1.05×K 惡化到 3.8×K）。
+ */
+function mix32(x) {
+  x = (x ^ (x >>> 16)) >>> 0;
+  x = Math.imul(x, 0x7feb352d) >>> 0;
+  x = (x ^ (x >>> 15)) >>> 0;
+  x = Math.imul(x, 0x846ca68b) >>> 0;
+  x = (x ^ (x >>> 16)) >>> 0;
+  return x >>> 0;
+}
+
+function xorshift32(seed) {
+  let s = seed >>> 0 || 0x9e3779b9;
+  return () => {
+    s ^= s << 13; s >>>= 0;
+    s ^= s >>> 17;
+    s ^= s << 5;  s >>>= 0;
+    return s;
+  };
+}
+
+// 產生 n 個 QPSK 符元（單位功率），供 probe 與 pilot 使用。
+function pskSequence(n, seed) {
+  const rnd = xorshift32(seed);
+  const re = new Float64Array(n);
+  const im = new Float64Array(n);
+  const a = Math.SQRT1_2;
+  for (let i = 0; i < n; i++) {
+    const v = rnd();
+    re[i] = (v & 1) ? a : -a;
+    im[i] = (v & 2) ? a : -a;
+  }
+  return { re, im };
+}
+
+// 高斯雜訊（Box-Muller）。模擬用，種子固定以便重現失敗案例。
+function gaussianSource(seed) {
+  const rnd = xorshift32(seed);
+  const u = () => (rnd() + 1) / 4294967297;
+  let spare = null;
+  return () => {
+    if (spare !== null) { const v = spare; spare = null; return v; }
+    const r = Math.sqrt(-2 * Math.log(u()));
+    const t = 2 * Math.PI * u();
+    spare = r * Math.sin(t);
+    return r * Math.cos(t);
+  };
+}
+
+// ═══ ../src/modem/plan.js ══════════════════════════════════════
+// OFDM 參數與副載波配置。所有數字都來自 Step 0 的實測結論。
+
+const SR = 48000;
+const N = 1024;          // FFT 大小 → 副載波間距 46.875 Hz
+const CP = 128;          // cyclic prefix，2.67 ms
+const SYM = N + CP;      // 1152 samples = 24 ms → 41.67 symbol/s
+const BIN_HZ = SR / N;
+
+// Step 0 定案：stealth 砍成 18–22 kHz（真正無聲，且避開筆電 16–18 kHz 的線圈嘯叫）
+const BANDS = {
+  turbo: { fLow: 2000, fHigh: 22000 },
+  stealth: { fLow: 18000, fHigh: 22000 },
+};
+
+const PILOT_SPACING = 8;   // 每 8 個副載波插一個 pilot
+const PROBE_SEED = 0x5741_5645;  // "WAVE"
+const PILOT_SEED = 0x50494c54;   // "PILT"
+
+// Step 0 定案：兩個模式都封頂 64QAM。256QAM 在瓶頸方向只換到 +8~13%，
+// 不值得為它承擔 1–2 度的相位精度要求。
+const MAX_BITS = 6;
+const GAP_DB = 6;                 // BER 1e-6 並計入編碼增益的實務差距
+const LADDER = [6, 4, 2, 1];      // 64QAM / 16QAM / QPSK / BPSK
+
+function bitsForSnr(snrDb, maxBits = MAX_BITS) {
+  if (!isFinite(snrDb)) return 0;
+  const eff = snrDb - GAP_DB;
+  if (eff <= 0) return 0;
+  const cap = Math.log2(1 + Math.pow(10, eff / 10));
+  for (const b of LADDER) if (b <= maxBits && cap >= b) return b;
+  return 0;
+}
+
+/**
+ * 建立傳輸計畫。
+ * @param {object} opts
+ * @param {'turbo'|'stealth'} opts.band
+ * @param {Map<number,number>|null} opts.snrByBin  每個 bin 的實測 SNR(dB)；null 表示全部用 fallbackBits
+ * @param {number} opts.fallbackBits  沒有量測資料時的保守預設
+ * @param {number} opts.maxBits
+ */
+function makePlan({ band = 'turbo', snrByBin = null, fallbackBits = 2, maxBits = MAX_BITS } = {}) {
+  const spec = BANDS[band];
+  if (!spec) throw new Error(`unknown band: ${band}`);
+
+  const binLow = Math.max(1, Math.ceil(spec.fLow / BIN_HZ));
+  const binHigh = Math.min(N / 2 - 1, Math.floor(spec.fHigh / BIN_HZ));
+
+  const bins = [];
+  for (let k = binLow; k <= binHigh; k++) bins.push(k);
+
+  // pilot 均勻分佈；兩端各放一個，讓相位斜率的線性擬合不外插
+  const pilotSet = new Set();
+  for (let i = 0; i < bins.length; i += PILOT_SPACING) pilotSet.add(bins[i]);
+  pilotSet.add(bins[bins.length - 1]);
+
+  const pilotBins = bins.filter((k) => pilotSet.has(k));
+  const dataBins = [];
+  const bitsByBin = new Map();
+  let bitsPerSymbol = 0;
+
+  for (const k of bins) {
+    if (pilotSet.has(k)) continue;
+    const b = snrByBin ? bitsForSnr(snrByBin.get(k) ?? -Infinity, maxBits) : fallbackBits;
+    if (b <= 0) continue;
+    dataBins.push(k);
+    bitsByBin.set(k, b);
+    bitsPerSymbol += b;
+  }
+
+  return {
+    band, spec, binLow, binHigh,
+    bins, pilotBins, dataBins, bitsByBin,
+    bitsPerSymbol,
+    rawBps: (bitsPerSymbol * SR) / SYM,
+    symbolSec: SYM / SR,
+  };
+}
+
+// 把 Step 0 摘要那種「每 250 Hz 一個整數 dB」的曲線攤成逐 bin 的 SNR。
+// 線性內插即可 —— 我們只用它決定調變階數，不需要更精細。
+function snrCurveToBins(curve) {
+  const pts = [...curve].sort((a, b) => a[0] - b[0]);
+  const out = new Map();
+  for (let k = 1; k < N / 2; k++) {
+    const hz = k * BIN_HZ;
+    if (hz < pts[0][0] || hz > pts[pts.length - 1][0]) continue;
+    let i = 0;
+    while (i < pts.length - 2 && pts[i + 1][0] < hz) i++;
+    const [x0, y0] = pts[i], [x1, y1] = pts[i + 1];
+    out.set(k, x1 === x0 ? y0 : y0 + ((y1 - y0) * (hz - x0)) / (x1 - x0));
+  }
+  return out;
+}
+
+// ═══ ../src/modem/qam.js ═══════════════════════════════════════
+// Gray 編碼的方形 QAM：BPSK(1) / QPSK(2) / 16QAM(4) / 64QAM(6)。
+//
+// b 為偶數時 I、Q 各分 b/2 個位元，各自是 L=2^(b/2) 階的 Gray PAM。
+// 每個星座都正規化成單位平均功率，等化與 SNR 換算才有共同基準。
+
+const cache = new Map();
+
+function grayToBinary(g) {
+  let b = g;
+  for (let s = 1; s < 32; s <<= 1) b ^= b >>> s;
+  return b;
+}
+
+function pamLevels(halfBits) {
+  const L = 1 << halfBits;
+  const lv = new Float64Array(L);
+  for (let g = 0; g < L; g++) lv[g] = 2 * grayToBinary(g) - (L - 1);
+  return lv;
+}
+
+function constellation(bits) {
+  if (cache.has(bits)) return cache.get(bits);
+  let c;
+  if (bits === 1) {
+    c = { bits, bpsk: true, levels: null, scale: 1, L: 2 };
+  } else {
+    if (bits % 2 !== 0) throw new Error(`unsupported bits/subcarrier: ${bits}`);
+    const half = bits / 2;
+    const L = 1 << half;
+    // E[|s|²] = 2·E[I²]，E[I²] = (L²−1)/3
+    c = { bits, bpsk: false, levels: pamLevels(half), scale: 1 / Math.sqrt((2 * (L * L - 1)) / 3), L, half };
+  }
+  cache.set(bits, c);
+  return c;
+}
+
+// 從 bit reader 取 b 個位元映射成一個複數符元
+function mapSymbol(readBits, bits) {
+  const c = constellation(bits);
+  if (c.bpsk) return [readBits(1) ? 1 : -1, 0];
+  const gi = readBits(c.half);
+  const gq = readBits(c.half);
+  return [c.levels[gi] * c.scale, c.levels[gq] * c.scale];
+}
+
+// 硬判決解映射，回傳 b 個位元（最高位在前，與 mapSymbol 對應）
+function demapSymbol(re, im, bits, writeBits) {
+  const c = constellation(bits);
+  if (c.bpsk) { writeBits(re > 0 ? 1 : 0, 1); return; }
+  writeBits(nearestGray(re / c.scale, c), c.half);
+  writeBits(nearestGray(im / c.scale, c), c.half);
+}
+
+function nearestGray(v, c) {
+  let best = 0, bd = Infinity;
+  for (let g = 0; g < c.L; g++) {
+    const d = Math.abs(v - c.levels[g]);
+    if (d < bd) { bd = d; best = g; }
+  }
+  return best;
+}
+
+// 位元讀寫器：以 MSB-first 打包進 Uint8Array
+function bitReader(bytes) {
+  let pos = 0;
+  return {
+    read(n) {
+      let v = 0;
+      for (let i = 0; i < n; i++) {
+        const byte = bytes[pos >> 3] ?? 0;
+        v = (v << 1) | ((byte >> (7 - (pos & 7))) & 1);
+        pos++;
+      }
+      return v;
+    },
+    get consumed() { return pos; },
+  };
+}
+
+function bitWriter(byteLen) {
+  const bytes = new Uint8Array(byteLen);
+  let pos = 0;
+  return {
+    write(v, n) {
+      for (let i = n - 1; i >= 0; i--) {
+        if ((v >> i) & 1) bytes[pos >> 3] |= 1 << (7 - (pos & 7));
+        pos++;
+      }
+    },
+    get bytes() { return bytes; },
+    get written() { return pos; },
+  };
+}
+
+// ═══ ../src/modem/frame.js ═════════════════════════════════════
+// 訊框結構與同步前導。
+//
+//   [ CHIRP 4096 ] [ GUARD 512 ] [ PROBE ×2 ] [ DATA ×D ]
+//
+// 用線性掃頻（chirp）而非 Schmidl-Cox 式的重複前導，理由是聲學通道：
+// chirp 的匹配濾波在多重路徑下仍給出銳利的峰，且處理增益 = BW×T
+// （stealth 模式 4 kHz × 85 ms ≈ 25 dB），在低 SNR 方向仍站得住。
+const CHIRP_LEN = 4096;
+const GUARD = 512;
+// 送 5 個 probe，接收端丟掉第一個只用後 4 個。
+// 第一個 probe 的前面是靜音，其餘的前面都是 probe —— ISI 條件不同。
+// 把它一起拿去平均，那個系統性差異會被雜訊估計器誤判成雜訊，
+// 回音越強誤判越大（實測 95 sample 的回音讓 SNR 憑空少報 8 dB）。
+const PROBE_SYMS = 5;
+const PROBE_SKIP = 1;
+const PROBE_USED = PROBE_SYMS - PROBE_SKIP;
+const PREAMBLE_LEN = CHIRP_LEN + GUARD;
+
+// Tukey 窗，避免掃頻起訖的方波邊緣灑出寬頻雜訊污染鄰近頻段
+function tukey(n, alpha = 0.15) {
+  const w = new Float64Array(n);
+  const edge = Math.floor((alpha * (n - 1)) / 2);
+  for (let i = 0; i < n; i++) {
+    if (i < edge) w[i] = 0.5 * (1 + Math.cos(Math.PI * (i / edge - 1)));
+    else if (i > n - 1 - edge) w[i] = 0.5 * (1 + Math.cos(Math.PI * ((n - 1 - i) / edge - 1)));
+    else w[i] = 1;
+  }
+  return w;
+}
+
+function makeChirp(fLow, fHigh, len = CHIRP_LEN, sr = SR) {
+  const w = tukey(len);
+  const out = new Float64Array(len);
+  const rate = (fHigh - fLow) / (len / sr);
+  for (let i = 0; i < len; i++) {
+    const t = i / sr;
+    out[i] = w[i] * Math.cos(2 * Math.PI * (fLow * t + 0.5 * rate * t * t));
+  }
+  return out;
+}
+
+// probe 各符元用同一組值：H 估計可平均降噪 10·log10(PROBE_SYMS) dB，
+// 且兩個符元在時域完全相同，日後要加二次同步確認很方便。
+function probeSequence(plan) {
+  return pskSequence(plan.bins.length, PROBE_SEED);
+}
+
+function pilotSequence(plan, symbolIndex) {
+  return pskSequence(plan.pilotBins.length, (PILOT_SEED + symbolIndex * 0x9e3779b9) >>> 0);
+}
+
+/**
+ * 以匹配濾波找 chirp 起點。
+ * @returns {{index:number, peak:number, ratio:number}} ratio 為峰值對背景中位數的比，
+ *          低於 ~8 表示沒抓到，應視為同步失敗而非硬用一個錯誤位置。
+ */
+function findPreamble(signal, chirp, searchFrom = 0, searchLen = signal.length) {
+  const len = Math.min(searchLen, signal.length - searchFrom);
+  if (len < chirp.length) return { index: -1, peak: 0, ratio: 0 };
+
+  let nfft = 1;
+  while (nfft < len + chirp.length) nfft <<= 1;
+  const corr = correlateMagSq(signal, searchFrom, len, chirp, nfft);
+
+  const valid = len - chirp.length + 1;
+  let best = 0, peak = -1;
+  for (let m = 0; m < valid; m++) if (corr[m] > peak) { peak = corr[m]; best = m; }
+
+  // 用中位數當背景，避免峰值本身把平均值拉高
+  const sample = [];
+  const stride = Math.max(1, Math.floor(valid / 2048));
+  for (let m = 0; m < valid; m += stride) sample.push(corr[m]);
+  sample.sort((a, b) => a - b);
+  const median = sample[sample.length >> 1] || 1e-30;
+
+  return { index: searchFrom + best, peak, ratio: Math.sqrt(peak / median) };
+}
+
+// 目標波峰因數。OFDM 原生的 PAPR 高達 18.7 dB（stealth），峰值把功放逼進
+// 非線性區，而平均功率卻很低。後果有兩個：
+//   1. 二階互調把頻帶內任兩個副載波的差頻生出來。stealth 是 18–22 kHz，
+//      差頻正好落在 0–4 kHz —— 最容易聽見的範圍。「超音波模式卻聽得到聲音」
+//      就是這樣來的（跟指向性喇叭的原理相同）。
+//   2. 帶內失真吃掉 SNR。Step 1b 量到原始頻譜 SNR 49 dB 但星座只有 19 dB，
+//      30 dB 的缺口就是這個。
+// 削到 11 dB：stealth 的 PAPR 18.7→12.6、turbo 25.1→11.2，
+// 同樣峰值下平均功率多 7~15 dB。搭配把輸出調低同樣的量，峰值就離開
+// 非線性區，二階互調降約 14 dB，而接收端的訊號強度不變。
+const TARGET_PAPR_DB = 11;
+const PAPR_ITERATIONS = 3;
+
+/**
+ * 削峰 + 濾波，反覆數次。
+ *
+ * 單純削峰會把能量灑到頻帶外（對 stealth 來說就是灑進可聽範圍），
+ * 所以每次削完都要濾回頻帶內；但濾波又會讓峰值部分長回來，故需迭代。
+ * 代價是帶內失真（EVM），11 dB 目標下 stealth 約 −32 dB、turbo 約 −21 dB，
+ * 都低於通道本身的雜訊（實測 19–22 dB）。
+ */
+function clipAndFilter(re, im, fft, bins) {
+  let rms = 0;
+  for (let i = 0; i < N; i++) rms += re[i] * re[i];
+  rms = Math.sqrt(rms / N);
+  if (rms <= 0) return;
+  const limit = rms * Math.pow(10, TARGET_PAPR_DB / 20);
+
+  const inBand = new Uint8Array(N);
+  for (const k of bins) { inBand[k] = 1; inBand[N - k] = 1; }
+
+  for (let it = 0; it < PAPR_ITERATIONS; it++) {
+    let clipped = 0;
+    for (let i = 0; i < N; i++) {
+      if (re[i] > limit) { re[i] = limit; clipped++; }
+      else if (re[i] < -limit) { re[i] = -limit; clipped++; }
+    }
+    if (!clipped) break;
+
+    im.fill(0);
+    fft.forward(re, im);
+    for (let k = 0; k < N; k++) if (!inBand[k]) { re[k] = 0; im[k] = 0; }
+    fft.inverse(re, im);
+  }
+}
+
+// 符元邊緣的升餘弦過渡長度。
+//
+// 每個符元單獨看是完美帶限的（實測帶外 −158 dB），但把符元接起來時
+// 邊界不連續，那個階躍會灑出寬頻噪音 —— 實測連續串接時 2–4 kHz 只有
+// −59 dB，對 stealth 來說就是直接可聽的雜音。
+//
+// 解法是讓每個符元多帶一段循環後綴，兩端各做一次升餘弦漸變，
+// 相鄰符元重疊相加。漸變區會吃掉 CP 的前 WINDOW 個 sample
+// （接收端的 FFT 視窗本來就從 CP−16 開始，剩下的延遲擴散預算
+// 從 112 降到 88，仍高於實測需要的 63）。
+const SYM_WINDOW = 24;
+const RAMP = (() => {
+  const r = new Float64Array(SYM_WINDOW);
+  for (let i = 0; i < SYM_WINDOW; i++) r[i] = 0.5 - 0.5 * Math.cos((Math.PI * (i + 0.5)) / SYM_WINDOW);
+  return r;
+})();
+
+// 把一組複數副載波值做 Hermitian 對稱擴展後 IFFT，得到實數時域符元。
+// 回傳長度為 SYM + SYM_WINDOW：多出來的是循環後綴，供重疊相加用。
+function toTimeSymbol(fft, specRe, specIm, bins = null) {
+  const re = new Float64Array(N), im = new Float64Array(N);
+  for (let k = 1; k < N / 2; k++) {
+    re[k] = specRe[k]; im[k] = specIm[k];
+    re[N - k] = specRe[k]; im[N - k] = -specIm[k];
+  }
+  re[0] = 0; im[0] = 0;
+  re[N / 2] = 0; im[N / 2] = 0;
+  fft.inverse(re, im);
+
+  if (bins) clipAndFilter(re, im, fft, bins);
+
+  const out = new Float64Array(SYM + SYM_WINDOW);
+  for (let i = 0; i < CP; i++) out[i] = re[N - CP + i];
+  for (let i = 0; i < N; i++) out[CP + i] = re[i];
+  // 循環後綴：body 的開頭，接在最後面
+  for (let i = 0; i < SYM_WINDOW; i++) out[SYM + i] = re[i];
+  // 兩端各做一次升餘弦漸變
+  for (let i = 0; i < SYM_WINDOW; i++) {
+    out[i] *= RAMP[i];
+    out[SYM + SYM_WINDOW - 1 - i] *= RAMP[i];
+  }
+  return out;
+}
+
+/**
+ * 認出「錄到的其實是 Step 0 的探測訊號」。
+ *
+ * Step 0 的多音是嚴格以 N 個 sample 為週期的循環播放，OFDM 訊框不是。
+ * 兩支工具的頻帶選項長得很像，很容易在 PC 上開著 Step 0 就按了播放 ——
+ * 那樣會錄到看似正常、實則完全解不開的訊號，而解調端只會報 BER 0.5，
+ * 讓人往錯的方向查。這裡直接指出來。
+ *
+ * @returns {{isStep0:boolean, rho:number}} rho 接近 1 即為 Step 0 訊號
+ */
+function detectStep0Signal(samples, offset = 0, len = 40000) {
+  const end = Math.min(offset + len, samples.length - N);
+  let num = 0, d1 = 0, d2 = 0;
+  for (let i = offset; i < end; i++) {
+    const a = samples[i], b = samples[i + N];
+    num += a * b; d1 += a * a; d2 += b * b;
+  }
+  const rho = d1 > 0 && d2 > 0 ? num / Math.sqrt(d1 * d2) : 0;
+  return { isStep0: rho > 0.8, rho };
+}
+
+function makeFFT() {
+  return new FFT(N);
+}
+
+// ═══ ../src/modem/tx.js ════════════════════════════════════════
+
+const TARGET_PEAK = 0.9;
+
+/**
+ * 把位元組調變成一段完整訊框。
+ * @param {Uint8Array} payload
+ * @param {object} plan  makePlan() 的輸出
+ * @returns {{samples: Float32Array, symbols: number, capacityBytes: number}}
+ */
+function modulate(payload, plan) {
+  const fft = makeFFT();
+  const bitsPerSym = plan.bitsPerSymbol;
+  if (bitsPerSym <= 0) throw new Error('plan 沒有任何可用副載波');
+
+  const symbols = Math.ceil((payload.length * 8) / bitsPerSym);
+  const capacityBytes = Math.floor((symbols * bitsPerSym) / 8);
+
+  const probe = probeSequence(plan);
+  const specRe = new Float64Array(N);
+  const specIm = new Float64Array(N);
+
+  const ofdm = [];
+
+  // ── probe：全頻帶已知 QPSK，兩個符元完全相同
+  specRe.fill(0); specIm.fill(0);
+  plan.bins.forEach((k, i) => { specRe[k] = probe.re[i]; specIm[k] = probe.im[i]; });
+  const probeSym = toTimeSymbol(fft, specRe, specIm, plan.bins);
+  for (let i = 0; i < PROBE_SYMS; i++) ofdm.push(probeSym);
+
+  // ── data
+  const reader = bitReader(payload);
+  const read = reader.read.bind(reader);
+  for (let s = 0; s < symbols; s++) {
+    specRe.fill(0); specIm.fill(0);
+    const pilots = pilotSequence(plan, s);
+    plan.pilotBins.forEach((k, i) => { specRe[k] = pilots.re[i]; specIm[k] = pilots.im[i]; });
+    for (const k of plan.dataBins) {
+      const [re, im] = mapSymbol(read, plan.bitsByBin.get(k));
+      specRe[k] = re; specIm[k] = im;
+    }
+    ofdm.push(toTimeSymbol(fft, specRe, specIm, plan.bins));
+  }
+
+  // OFDM 的 PAPR 高，chirp 近乎定包絡。分開正規化到同一個峰值，
+  // 讓兩者都用滿動態範圍 —— chirp 因此帶著遠高於資料段的能量，
+  // 這對同步是好事（處理增益全給了最需要可靠的那一步）。
+  let peak = 0;
+  for (const sym of ofdm) for (const v of sym) { const a = Math.abs(v); if (a > peak) peak = a; }
+  const gain = peak > 0 ? TARGET_PEAK / peak : 0;
+
+  const chirp = makeChirp(plan.spec.fLow, plan.spec.fHigh);
+  // 尾端多留 SYM_WINDOW 讓最後一個符元的漸變收乾淨
+  const total = PREAMBLE_LEN + ofdm.length * SYM + SYM_WINDOW;
+  const out = new Float32Array(total);
+
+  for (let i = 0; i < CHIRP_LEN; i++) out[i] = chirp[i] * TARGET_PEAK;
+  // 重疊相加：每個符元前進 SYM，但長度是 SYM+SYM_WINDOW，
+  // 所以相鄰符元的漸變區會互相補上，接縫處不再有階躍。
+  let p = PREAMBLE_LEN;
+  for (const sym of ofdm) {
+    for (let i = 0; i < sym.length; i++) out[p + i] += sym[i] * gain;
+    p += SYM;
+  }
+
+  return { samples: out, symbols, capacityBytes, ofdmGain: gain };
+}
+
+// ═══ ../src/modem/rx.js ════════════════════════════════════════
+
+// FFT 視窗比 CP 結尾提早這麼多開始。CP 的 128 個 sample 是一份要分配的預算：
+// 一部分給前導的定時誤差，剩下的才是能容忍的通道延遲擴散。
+//
+// chirp 匹配濾波的定時解析度約為 1/BW —— turbo 頻寬 20 kHz 時只有 2.4 個
+// sample，stealth 的 4 kHz 也才 12 個。原本取 32 過度保守，把延遲擴散預算
+// 壓到 96 samples；實測 95 sample 的回音就會踩線產生 ISI，而且劣化隨頻率
+// 遞增（20 kHz 處掉 12 dB）。改成 16 後預算為 112 samples ≈ 2.3 ms，
+// 對應 80 cm 的路徑差。
+const WINDOW_ADVANCE = 16;
+const MIN_SYNC_RATIO = 8;
+
+// 實體時脈差的上限。消費級音訊晶振通常在 ±50 ppm 內，兩台裝置相加也不會
+// 超過幾百 ppm。低 SNR 時漂移估計是純噪音，不設限就會算出離譜的 step
+// 去重讀 probe，整條解調鏈當場崩掉（實測 BPSK 4 dB 時 SNR 掉到 −24 dB）。
+const MAX_PPM = 1000;
+const clampRho = (r) => Math.max(-MAX_PPM / 1e6, Math.min(MAX_PPM / 1e6, r || 0));
+
+// step 為 1 時走整數索引的快路；只有需要補償時脈差時才付插值的代價。
+function fftAt(fft, samples, start, re, im, step = 1) {
+  if (step === 1 && Number.isInteger(start)) {
+    for (let i = 0; i < N; i++) {
+      const idx = start + i;
+      re[i] = idx >= 0 && idx < samples.length ? samples[idx] : 0;
+      im[i] = 0;
+    }
+  } else {
+    for (let i = 0; i < N; i++) {
+      const pos = start + i * step;
+      re[i] = pos >= 0 && pos < samples.length - 1 ? sincAt(samples, pos) : 0;
+      im[i] = 0;
+    }
+  }
+  fft.forward(re, im);
+}
+
+// 5-tap 二項式平滑。殘餘相位在頻率上是一條直線，而對稱濾波器作用在
+// 線性相位斜坡上只會等比縮小振幅、完全不動相位，所以這個平滑不引入偏差，
+// 只換來約 5.6 dB 的噪音抑制。
+const SMOOTH = [1, 4, 6, 4, 1];
+const SMOOTH_SUM = 16;
+
+/**
+ * 由 pilot 殘餘估出「每個 bin 各自的」相位校正量。
+ *
+ * 不用全域線性擬合 —— 那會把斜率的估計誤差外推到頻帶兩端放大兩百倍以上，
+ * 低 SNR 時整個星座直接被轉爛（實測 BPSK 4 dB、QPSK 7 dB 全毀，
+ * 而同時 16/64QAM 因為配的 SNR 高所以看起來正常，差點誤導成「低階調變有問題」）。
+ * 改成只在相鄰 pilot 之間內插：每個資料副載波的校正只來自它左右兩個 pilot，
+ * 噪音不會被外推。
+ *
+ * @returns {{corrRe:Float64Array, corrIm:Float64Array, tau:number}}
+ *          corr 為單位長度的共軛校正子；tau 僅供視窗追蹤的慢速回饋使用。
+ */
+function pilotCorrection(zRe, zIm, plan, pilots, out) {
+  const bins = plan.pilotBins;
+  const n = bins.length;
+  const { rawRe, rawIm, smRe, smIm, corrRe, corrIm } = out;
+
+  for (let i = 0; i < n; i++) {
+    const k = bins[i];
+    const pr = pilots.re[i], pi = pilots.im[i];
+    rawRe[i] = zRe[k] * pr + zIm[k] * pi;
+    rawIm[i] = zIm[k] * pr - zRe[k] * pi;
+  }
+
+  for (let i = 0; i < n; i++) {
+    let ar = 0, ai = 0;
+    for (let t = -2; t <= 2; t++) {
+      let j = i + t;
+      if (j < 0) j = -j;                    // 邊界反射
+      if (j >= n) j = 2 * (n - 1) - j;
+      const w = SMOOTH[t + 2];
+      ar += rawRe[j] * w; ai += rawIm[j] * w;
+    }
+    smRe[i] = ar / SMOOTH_SUM; smIm[i] = ai / SMOOTH_SUM;
+  }
+
+  // 相鄰 pilot 之間做正規化線性內插（nlerp）。相位差在 ±π 內時，
+  // 弦與弧的差異只影響振幅，我們只取相位，所以無妨。
+  for (let i = 0; i < n - 1; i++) {
+    const k0 = bins[i], k1 = bins[i + 1];
+    const span = k1 - k0;
+    for (let k = k0; k < k1; k++) {
+      const t = (k - k0) / span;
+      const ar = smRe[i] * (1 - t) + smRe[i + 1] * t;
+      const ai = smIm[i] * (1 - t) + smIm[i + 1] * t;
+      const m = Math.hypot(ar, ai) || 1;
+      corrRe[k] = ar / m; corrIm[k] = -ai / m;   // 共軛 → 用乘的就能抵銷
+    }
+  }
+  {
+    const k = bins[n - 1];
+    const m = Math.hypot(smRe[n - 1], smIm[n - 1]) || 1;
+    corrRe[k] = smRe[n - 1] / m; corrIm[k] = -smIm[n - 1] / m;
+  }
+
+  // 視窗追蹤要的 τ：整個頻帶的平均相位斜率。這裡外推誤差無所謂，
+  // 因為它只餵進一個慢速的整數視窗回饋，還會再經過時間上的平滑。
+  //
+  // 符號：視窗晚 τ 個 sample 時取到的是 x[n+τ]，而 DFT{x[n+τ]}[k]
+  // = X[k]·e^{+j2πkτ/N}，所以斜率為正 → τ = slope·N/2π。
+  let dr = 0, di = 0;
+  for (let i = 1; i < n; i++) {
+    if (bins[i] - bins[i - 1] !== PILOT_SPACING) continue;
+    dr += smRe[i] * smRe[i - 1] + smIm[i] * smIm[i - 1];
+    di += smIm[i] * smRe[i - 1] - smRe[i] * smIm[i - 1];
+  }
+  const slope = dr === 0 && di === 0 ? 0 : Math.atan2(di, dr) / PILOT_SPACING;
+
+  // 相干度：複數和的長度 ÷ 各項長度之和。1 代表所有相鄰 pilot 對給出一致的
+  // 相位差（鎖定），趨近 0 代表 τ 估計已是純噪音。低 SNR 時若不看這個就
+  // 硬更新迴路，積分項會隨機漫步跑掉（實測 BPSK 4 dB 直接失鎖）。
+  let magSum = 0;
+  for (let i = 1; i < n; i++) {
+    if (bins[i] - bins[i - 1] !== PILOT_SPACING) continue;
+    magSum += Math.hypot(smRe[i], smIm[i]) * Math.hypot(smRe[i - 1], smIm[i - 1]);
+  }
+  const coherence = magSum > 0 ? Math.hypot(dr, di) / magSum : 0;
+
+  // 未經校正的噪音估計。不能拿「校正後的 pilot」量 —— 校正量就是從這些
+  // pilot 自己算出來的，會把自身噪音抵掉一部分，SNR 被高估。
+  // 用 raw 對 smooth 的殘差，再除以平滑器的方差係數 (1−2w₀+Σw²) 還原。
+  let nAcc = 0, nCnt = 0;
+  for (let i = 0; i < n; i++) {
+    const dr2 = rawRe[i] - smRe[i], di2 = rawIm[i] - smIm[i];
+    nAcc += dr2 * dr2 + di2 * di2; nCnt++;
+  }
+  const RESID_FACTOR = 1 - (2 * SMOOTH[2]) / SMOOTH_SUM +
+    SMOOTH.reduce((a, v) => a + v * v, 0) / (SMOOTH_SUM * SMOOTH_SUM);
+
+  return { tau: (slope * N) / (2 * Math.PI), coherence, noiseVar: nCnt ? nAcc / nCnt / RESID_FACTOR : Infinity };
+}
+
+// 各 probe 符元相對第一個的定時差，以及由其斜率推得的時脈差。
+function estimateProbeDrift(hsRe, hsIm, bins) {
+  const dtau = new Float64Array(hsRe.length);
+  for (let s = 1; s < hsRe.length; s++) {
+    let dr = 0, di = 0;
+    for (let i = 1; i < bins.length; i++) {
+      if (bins[i] - bins[i - 1] !== 1) continue;
+      const k = bins[i], j = bins[i - 1];
+      // (H_s[k]·conj(H_0[k])) · conj(H_s[j]·conj(H_0[j]))
+      const ar = hsRe[s][k] * hsRe[0][k] + hsIm[s][k] * hsIm[0][k];
+      const ai = hsIm[s][k] * hsRe[0][k] - hsRe[s][k] * hsIm[0][k];
+      const br = hsRe[s][j] * hsRe[0][j] + hsIm[s][j] * hsIm[0][j];
+      const bi = hsIm[s][j] * hsRe[0][j] - hsRe[s][j] * hsIm[0][j];
+      dr += ar * br + ai * bi;
+      di += ai * br - ar * bi;
+    }
+    dtau[s] = dr === 0 && di === 0 ? 0 : (Math.atan2(di, dr) * N) / (2 * Math.PI);
+  }
+  // 用擬合出來的直線取代個別估計值。漂移對符元序號本來就是線性的，
+  // 而每個 dtau[s] 的估計噪音在去旋轉時會被乘上 2πk/N 放大到高頻 ——
+  // 直接拿個別值去旋轉，等於把噪音注進通道估計，逐 bin SNR 因此少報約 2 dB。
+  let sxy = 0, sxx = 0;
+  const mean = (dtau.length - 1) / 2;
+  let dm = 0;
+  for (let s = 0; s < dtau.length; s++) dm += dtau[s];
+  dm /= dtau.length;
+  for (let s = 0; s < dtau.length; s++) { sxy += (s - mean) * (dtau[s] - dm); sxx += (s - mean) ** 2; }
+  const perSym = sxx > 0 ? sxy / sxx : 0;
+
+  const fit = new Float64Array(dtau.length);
+  for (let s = 0; s < dtau.length; s++) fit[s] = dm + (s - mean) * perSym;
+
+  return { dtau: fit, rho: perSym / SYM };
+}
+
+function smoothReal(src, bins) {
+  const n = bins.length;
+  const out = new Float64Array(src.length);
+  for (let i = 0; i < n; i++) {
+    let a = 0;
+    for (let t = -2; t <= 2; t++) {
+      let j = i + t;
+      if (j < 0) j = -j;
+      if (j >= n) j = 2 * (n - 1) - j;
+      a += src[bins[j]] * SMOOTH[t + 2];
+    }
+    out[bins[i]] = a / SMOOTH_SUM;
+  }
+  return out;
+}
+
+/**
+ * 沿頻率方向平滑通道估計。
+ *
+ * 直接用 probe 平均出來的 H 噪音只比資料低 10·log10(PROBE_SYMS) dB，
+ * 等化時又把它注回訊號，實測在 64QAM 吃掉約 1.8 dB。通道的延遲擴散遠小於
+ * FFT 長度，H 在頻率上本來就平滑，所以可以再濾一次。
+ *
+ * 但不能直接濾：視窗刻意提早 WINDOW_ADVANCE 開始，加上前導的殘餘定時誤差，
+ * 讓 H 帶著明顯的線性相位斜坡（每 bin 約 0.2 rad）。對稱濾波器碰到斜坡會
+ * 保相位但縮振幅，造成約 7% 的增益偏差。所以先估出整體斜率、去旋轉、
+ * 平滑、再轉回來。
+ */
+function smoothChannel(hRe, hIm, bins) {
+  const n = bins.length;
+  if (n < 5) return;
+
+  let dr = 0, di = 0;
+  for (let i = 1; i < n; i++) {
+    if (bins[i] - bins[i - 1] !== 1) continue;
+    const a = i, b = i - 1;
+    dr += hRe[bins[a]] * hRe[bins[b]] + hIm[bins[a]] * hIm[bins[b]];
+    di += hIm[bins[a]] * hRe[bins[b]] - hRe[bins[a]] * hIm[bins[b]];
+  }
+  const slope = dr === 0 && di === 0 ? 0 : Math.atan2(di, dr);
+
+  const dRe = new Float64Array(n), dIm = new Float64Array(n);
+  for (let i = 0; i < n; i++) {
+    const k = bins[i];
+    const a = -slope * k;
+    const c = Math.cos(a), s = Math.sin(a);
+    dRe[i] = hRe[k] * c - hIm[k] * s;
+    dIm[i] = hRe[k] * s + hIm[k] * c;
+  }
+
+  const oRe = new Float64Array(n), oIm = new Float64Array(n);
+  for (let i = 0; i < n; i++) {
+    let ar = 0, ai = 0;
+    for (let t = -2; t <= 2; t++) {
+      let j = i + t;
+      if (j < 0) j = -j;
+      if (j >= n) j = 2 * (n - 1) - j;
+      const w = SMOOTH[t + 2];
+      ar += dRe[j] * w; ai += dIm[j] * w;
+    }
+    oRe[i] = ar / SMOOTH_SUM; oIm[i] = ai / SMOOTH_SUM;
+  }
+
+  for (let i = 0; i < n; i++) {
+    const k = bins[i];
+    const a = slope * k;
+    const c = Math.cos(a), s = Math.sin(a);
+    hRe[k] = oRe[i] * c - oIm[i] * s;
+    hIm[k] = oRe[i] * s + oIm[i] * c;
+  }
+}
+
+/**
+ * 解調一段訊框。
+ * @param {Float32Array} samples
+ * @param {object} plan
+ * @param {{symbols:number, payloadBytes?:number}} opts
+ */
+function demodulate(samples, plan, opts) {
+  const { symbols } = opts;
+  if (!symbols) throw new Error('需要 opts.symbols');
+
+  const fft = makeFFT();
+  const chirp = makeChirp(plan.spec.fLow, plan.spec.fHigh);
+  const sync = findPreamble(samples, chirp);
+  if (sync.index < 0 || sync.ratio < MIN_SYNC_RATIO) {
+    return { ok: false, reason: `同步失敗（ratio ${sync.ratio.toFixed(1)} < ${MIN_SYNC_RATIO}）`, sync };
+  }
+
+  const base = sync.index + PREAMBLE_LEN;
+  const re = new Float64Array(N), im = new Float64Array(N);
+
+  // ── 通道估計。前導的定時誤差在這裡被吸收進 H（表現為固定相位斜率），
+  //    因此後續只需追蹤「飄移」，不需要絕對定時精度。
+  //
+  //    但不能直接把幾個 probe 符元加起來平均：時脈差會讓它們彼此錯開，
+  //    500 ppm 下 4 個符元跨度就差 2.3 個 sample，在 k=469 相位差 6.6 rad，
+  //    盲目相加等於自我抵銷，高頻段的 H 會被抹平。
+  //    所以先量出每個 probe 相對第一個的定時差、去旋轉、再平均，
+  //    順便從這個差值的斜率取得時脈差的初值餵給後面的 PI 迴路。
+  const probe = probeSequence(plan);
+  const bins = plan.bins;
+  let hsRe = [], hsIm = [];
+
+  // 兩趟：第一趟用 step=1 粗估時脈差，第二趟帶著它重讀。
+  // 單趟不夠 —— 500 ppm 時單一 probe 符元內部就伸縮 0.5 個 sample，
+  // 這個 ICI 是 step 縮放才修得掉的，事後去旋轉補不回來。
+  let rho0 = 0;
+  for (let pass = 0; pass < 2; pass++) {
+    const step = 1 - rho0;
+    hsRe = []; hsIm = [];
+    for (let s = PROBE_SKIP; s < PROBE_SYMS; s++) {
+      const start = base + (s * SYM + CP - WINDOW_ADVANCE) * step;
+      fftAt(fft, samples, start, re, im, step);
+      const a = new Float64Array(N), b = new Float64Array(N);
+      bins.forEach((k, i) => {
+        const pr = probe.re[i], pi = probe.im[i];
+        a[k] = re[k] * pr + im[k] * pi;
+        b[k] = im[k] * pr - re[k] * pi;
+      });
+      hsRe.push(a); hsIm.push(b);
+    }
+    rho0 = clampRho(rho0 + estimateProbeDrift(hsRe, hsIm, bins).rho);
+  }
+
+  const { dtau } = estimateProbeDrift(hsRe, hsIm, bins);
+
+  // 去旋轉後平均，同時用「各 probe 之間的離散程度」量出逐 bin 的雜訊 ——
+  // 這就是自適應 bit-loading 需要的東西，不必再另外送一次探測序列。
+  const hRe = new Float64Array(N), hIm = new Float64Array(N);
+  const alignRe = [], alignIm = [];
+  for (let s = 0; s < PROBE_USED; s++) {
+    const a = new Float64Array(N), b = new Float64Array(N);
+    for (const k of bins) {
+      const ang = (-2 * Math.PI * k * dtau[s]) / N;
+      const c = Math.cos(ang), sn = Math.sin(ang);
+      a[k] = hsRe[s][k] * c - hsIm[s][k] * sn;
+      b[k] = hsRe[s][k] * sn + hsIm[s][k] * c;
+      hRe[k] += a[k]; hIm[k] += b[k];
+    }
+    alignRe.push(a); alignIm.push(b);
+  }
+  for (const k of bins) { hRe[k] /= PROBE_USED; hIm[k] /= PROBE_USED; }
+
+  const rawNoise = new Float64Array(N);
+  for (const k of bins) {
+    let v = 0;
+    for (let s = 0; s < PROBE_USED; s++) {
+      const dr = alignRe[s][k] - hRe[k], di = alignIm[s][k] - hIm[k];
+      v += dr * dr + di * di;
+    }
+    rawNoise[k] = v / (PROBE_USED - 1);
+  }
+  // 只有 PROBE_SYMS−1 個自由度，方差估計本身很吵；沿頻率平滑一次
+  const noiseByBin = smoothReal(rawNoise, bins);
+
+  smoothChannel(hRe, hIm, plan.bins);
+
+  const weight = new Float64Array(N);
+  // 逐副載波 SNR：訊號功率要扣掉平均本身殘留的雜訊 (var/PROBE_SYMS)
+  const snrByBin = new Map();
+  for (const k of plan.bins) {
+    weight[k] = hRe[k] * hRe[k] + hIm[k] * hIm[k];
+    const nv = noiseByBin[k];
+    const sig = Math.max(weight[k] - nv / PROBE_USED, 0);
+    snrByBin.set(k, nv > 0 ? 10 * Math.log10(sig / nv) : -Infinity);
+  }
+
+  // ── 資料符元
+  const totalBits = symbols * plan.bitsPerSymbol;
+  const w = bitWriter(Math.ceil(totalBits / 8));
+  const write = w.write.bind(w);
+
+  const zRe = new Float64Array(N), zIm = new Float64Array(N);
+  const nP = plan.pilotBins.length;
+  const scratch = {
+    rawRe: new Float64Array(nP), rawIm: new Float64Array(nP),
+    smRe: new Float64Array(nP), smIm: new Float64Array(nP),
+    corrRe: new Float64Array(N), corrIm: new Float64Array(N),
+  };
+
+  // 時脈追蹤走 PI 迴路：
+  //   posOffset（比例項）吸收當下的定時誤差
+  //   rho（積分項）估計收發時脈的相對差，用來縮放取樣間距
+  //
+  // 只做整數視窗位移是不夠的 —— 那只修正「定時」，修不了「頻率縮放」。
+  // 時脈差 δ 會讓副載波間距也縮放 δ，在 k=469 造成 0.09 bin 的偏移，
+  // ICI 約 −15 dB，200 ppm 時就足以讓 16QAM 的 BER 停在 5e-3 下不去。
+  // 視窗位置用「遞增」推進，不是每次從 base 乘上 step 重算。
+  // 後者會讓積分項的迴路增益隨符元序號線性成長（s=100 時增益變成 4 倍），
+  // 必然震盪發散 —— 實測 rho 直接跑到 3000 ppm。
+  //
+  // 誤差動態：e[s+1] = (1−KP)e[s] + SYM·δ − u[s]，u[s+1] = u[s] + KI·e[s]
+  // 特徵方程 z² − (2−KP)z + (1−KP+KI)，KP=0.2/KI=0.02 時根為 0.9±0.1j，
+  // |z| = 0.906 < 1，時間常數約 10 個符元。
+  const KP = 0.20;
+  const KI = 0.02;
+  let rho = rho0;
+  let pos = base + (PROBE_SYMS * SYM + CP - WINDOW_ADVANCE) * (1 - rho);
+  let noiseAcc = 0, noiseCnt = 0;
+  let lastTau = 0;
+
+  for (let s = 0; s < symbols; s++) {
+    const step = 1 - rho;
+    fftAt(fft, samples, pos, re, im, step);
+
+    for (const k of plan.bins) {
+      const d = weight[k];
+      if (d < 1e-20) { zRe[k] = 0; zIm[k] = 0; continue; }
+      zRe[k] = (re[k] * hRe[k] + im[k] * hIm[k]) / d;
+      zIm[k] = (im[k] * hRe[k] - re[k] * hIm[k]) / d;
+    }
+
+    const pilots = pilotSequence(plan, s);
+    const est = pilotCorrection(zRe, zIm, plan, pilots, scratch);
+    lastTau = est.tau;
+    noiseAcc += est.noiseVar; noiseCnt++;
+
+    for (const k of plan.bins) {
+      const cr = scratch.corrRe[k], ci = scratch.corrIm[k];
+      const rr = zRe[k] * cr - zIm[k] * ci;
+      const ii = zRe[k] * ci + zIm[k] * cr;
+      zRe[k] = rr; zIm[k] = ii;
+    }
+
+    for (const k of plan.dataBins) {
+      demapSymbol(zRe[k], zIm[k], plan.bitsByBin.get(k), write);
+    }
+
+    // τ > 0 表示視窗取晚了 → 位置往前拉，同時把時脈估計往上修。
+    // 迴路增益乘上相干度：估計不可信時自動凍結，而不是被噪音牽著走。
+    const g = est.coherence;
+    pos -= KP * g * lastTau;
+    rho = clampRho(rho + (KI * g * lastTau) / SYM);
+    pos += SYM * (1 - rho);
+  }
+
+  // 星座為單位平均功率，所以 SNR 就是 1/噪音方差
+  const noiseVar = noiseCnt ? noiseAcc / noiseCnt : Infinity;
+  return {
+    ok: true,
+    bytes: w.bytes,
+    sync,
+    noiseVar,
+    snrDb: noiseVar > 0 ? -10 * Math.log10(noiseVar) : Infinity,
+    driftSamples: lastTau,
+    rhoPpm: rho * 1e6,
+    residTau: lastTau,
+    snrByBin,
+  };
+}
+
+// ═══ ../src/dsp/sha256.js ══════════════════════════════════════
+// 純 JS SHA-256。
+//
+// 不用 crypto.subtle 是因為它是非同步的、而且與 Node 的介面不同；
+// 自己實作可讓瀏覽器、Node 測試、離線工具跑完全同一份程式碼，
+// 也讓打包後的單檔不依賴任何平台 API。
+
+const K = new Uint32Array([
+  0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+  0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+  0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+  0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+  0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+  0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+  0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+  0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+]);
+
+const rotr = (x, n) => ((x >>> n) | (x << (32 - n))) >>> 0;
+
+function sha256(bytes) {
+  const h = new Uint32Array([
+    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+  ]);
+
+  const bitLen = bytes.length * 8;
+  const padded = new Uint8Array((((bytes.length + 9) >> 6) + 1) << 6);
+  padded.set(bytes);
+  padded[bytes.length] = 0x80;
+  // 長度為 64-bit big-endian；JS 位元運算只有 32 bit，高位用除法取
+  const hi = Math.floor(bitLen / 0x100000000);
+  const view = new DataView(padded.buffer);
+  view.setUint32(padded.length - 8, hi, false);
+  view.setUint32(padded.length - 4, bitLen >>> 0, false);
+
+  const w = new Uint32Array(64);
+  for (let off = 0; off < padded.length; off += 64) {
+    for (let i = 0; i < 16; i++) w[i] = view.getUint32(off + i * 4, false);
+    for (let i = 16; i < 64; i++) {
+      const s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >>> 3);
+      const s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >>> 10);
+      w[i] = (w[i - 16] + s0 + w[i - 7] + s1) >>> 0;
+    }
+    let [a, b, c, d, e, f, g, hh] = h;
+    for (let i = 0; i < 64; i++) {
+      const S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+      const ch = (e & f) ^ (~e & g);
+      const t1 = (hh + S1 + ch + K[i] + w[i]) >>> 0;
+      const S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+      const maj = (a & b) ^ (a & c) ^ (b & c);
+      const t2 = (S0 + maj) >>> 0;
+      hh = g; g = f; f = e; e = (d + t1) >>> 0;
+      d = c; c = b; b = a; a = (t1 + t2) >>> 0;
+    }
+    h[0] = (h[0] + a) >>> 0; h[1] = (h[1] + b) >>> 0; h[2] = (h[2] + c) >>> 0; h[3] = (h[3] + d) >>> 0;
+    h[4] = (h[4] + e) >>> 0; h[5] = (h[5] + f) >>> 0; h[6] = (h[6] + g) >>> 0; h[7] = (h[7] + hh) >>> 0;
+  }
+
+  const out = new Uint8Array(32);
+  new DataView(out.buffer).setUint32(0, h[0], false);
+  for (let i = 0; i < 8; i++) new DataView(out.buffer).setUint32(i * 4, h[i], false);
+  return out;
+}
+
+const hex = (b) => [...b].map((v) => v.toString(16).padStart(2, '0')).join('');
+
+// ═══ ../src/fountain/lt.js ═════════════════════════════════════
+// Luby Transform 噴泉碼。
+//
+// 為什麼用噴泉碼而不是「編號 + 重傳」：聲學通道是單向廣播，沒有回傳通道，
+// 而且封包遺失率會隨擺位與環境劇烈變化。噴泉碼讓發送端只管一直產生新封包，
+// 接收端湊夠「任意」K·(1+ε) 個就能還原 —— 掉包只是變慢，不會出錯，
+// 也不需要任何握手。
+//
+// 解碼用剝離法（peeling）為主：O(K log K)，快。剝離卡住時改用 GF(2) 的
+// 高斯消去處理殘餘部分 —— 純剝離會在還差幾塊時停住，那時再多收封包也沒用，
+// 而殘餘規模通常很小，消去很便宜。
+const C = 0.03;
+const DELTA = 0.05;
+
+/**
+ * Robust Soliton 分布的累積機率表。
+ * ρ 是理想 Soliton（期望上剛好每次剝離出一塊），τ 是加在小度數與 K/R 處的
+ * 修正項，用來降低剝離中途斷鏈的機率。
+ */
+function robustSoliton(k) {
+  if (k < 1) throw new Error('k must be >= 1');
+  const r = C * Math.log(k / DELTA) * Math.sqrt(k);
+  const kr = Math.max(1, Math.round(k / r));
+
+  const p = new Float64Array(k + 1);
+  p[1] = 1 / k;
+  for (let i = 2; i <= k; i++) p[i] = 1 / (i * (i - 1));
+
+  const t = new Float64Array(k + 1);
+  for (let i = 1; i < kr; i++) t[i] = r / (i * k);
+  if (kr <= k) t[kr] = (r * Math.log(r / DELTA)) / k;
+
+  let beta = 0;
+  for (let i = 1; i <= k; i++) beta += p[i] + t[i];
+
+  const cdf = new Float64Array(k + 1);
+  let acc = 0;
+  for (let i = 1; i <= k; i++) { acc += (p[i] + t[i]) / beta; cdf[i] = acc; }
+  cdf[k] = 1;
+  return cdf;
+}
+
+// 二分搜尋 cdf → 度數
+function pickDegree(cdf, u) {
+  let lo = 1, hi = cdf.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (cdf[mid] < u) lo = mid + 1; else hi = mid;
+  }
+  return lo;
+}
+
+/**
+ * 由 seed 決定這個封包混合了哪幾塊。
+ * 收發兩端跑同一個函式、同一個 seed，就會得到同一組索引 ——
+ * 所以封包裡只要帶 seed，不必帶索引清單。
+ */
+function blocksForSeed(seed, k, cdf) {
+  const rnd = xorshift32(mix32(seed >>> 0));
+  const deg = Math.min(k, pickDegree(cdf, (rnd() + 1) / 4294967297));
+  if (deg >= k) {
+    const all = new Uint32Array(k);
+    for (let i = 0; i < k; i++) all[i] = i;
+    return all;
+  }
+  // Floyd 取樣：不重複地抽 deg 個，避免 deg 接近 k 時的拒絕重抽退化
+  const seen = new Set();
+  const out = new Uint32Array(deg);
+  let n = 0;
+  for (let j = k - deg; j < k; j++) {
+    const t = Math.floor(((rnd() + 1) / 4294967297) * (j + 1));
+    const v = seen.has(t) ? j : t;
+    seen.add(v);
+    out[n++] = v;
+  }
+  return out;
+}
+
+class Encoder {
+  /**
+   * @param {Uint8Array} data 原始資料
+   * @param {number} blockSize 每塊位元組數
+   */
+  constructor(data, blockSize) {
+    this.blockSize = blockSize;
+    this.k = Math.max(1, Math.ceil(data.length / blockSize));
+    this.cdf = robustSoliton(this.k);
+    // 補齊最後一塊，讓所有塊等長，XOR 才不用處理邊界
+    this.blocks = new Uint8Array(this.k * blockSize);
+    this.blocks.set(data);
+    this.dataLength = data.length;
+    this.counter = 0;
+  }
+
+  /** 產生第 seed 號封包的內容（不含表頭） */
+  encode(seed, out = new Uint8Array(this.blockSize)) {
+    out.fill(0);
+    const idx = blocksForSeed(seed, this.k, this.cdf);
+    for (const b of idx) {
+      const off = b * this.blockSize;
+      for (let i = 0; i < this.blockSize; i++) out[i] ^= this.blocks[off + i];
+    }
+    return out;
+  }
+
+  /** 依序取下一個 seed。前 k 個刻意用「度數 1 且依序」的系統性封包 */
+  nextSeed() {
+    return (this.counter++) >>> 0;
+  }
+}
+
+class Decoder {
+  /**
+   * @param {number} k 原始塊數
+   * @param {number} blockSize
+   */
+  constructor(k, blockSize) {
+    this.k = k;
+    this.blockSize = blockSize;
+    this.cdf = robustSoliton(k);
+    this.solved = new Array(k).fill(null);
+    this.solvedCount = 0;
+    this.pending = [];                     // {set:Set<number>, data:Uint8Array}
+    this.byBlock = new Map();              // blockIndex → Set<pending>
+    this.seen = new Set();                 // 已收過的 seed，去重
+    this.received = 0;
+  }
+
+  get done() { return this.solvedCount >= this.k; }
+  get progress() { return this.solvedCount / this.k; }
+
+  /**
+   * 收下一個封包。
+   * @returns {boolean} 是否為新封包（false 表示重複，已忽略）
+   */
+  add(seed, payload) {
+    if (this.seen.has(seed)) return false;
+    this.seen.add(seed);
+    this.received++;
+
+    const data = payload.slice(0, this.blockSize);
+    const set = new Set();
+    for (const b of blocksForSeed(seed, this.k, this.cdf)) {
+      if (this.solved[b]) {
+        const s = this.solved[b];
+        for (let i = 0; i < this.blockSize; i++) data[i] ^= s[i];
+      } else if (set.has(b)) {
+        set.delete(b);                     // 同一塊出現兩次 → XOR 後抵銷
+      } else {
+        set.add(b);
+      }
+    }
+
+    this._insert({ set, data });
+    this._peel();
+    return true;
+  }
+
+  _insert(p) {
+    if (p.set.size === 0) return;          // 全部已知，沒有新資訊
+    this.pending.push(p);
+    for (const b of p.set) {
+      let s = this.byBlock.get(b);
+      if (!s) { s = new Set(); this.byBlock.set(b, s); }
+      s.add(p);
+    }
+  }
+
+  _remove(p) {
+    for (const b of p.set) this.byBlock.get(b)?.delete(p);
+    const i = this.pending.indexOf(p);
+    if (i >= 0) this.pending.splice(i, 1);
+  }
+
+  _solve(b, data) {
+    if (this.solved[b]) return;
+    this.solved[b] = data;
+    this.solvedCount++;
+    const dependents = this.byBlock.get(b);
+    if (!dependents) return;
+    this.byBlock.delete(b);
+    for (const p of [...dependents]) {
+      for (let i = 0; i < this.blockSize; i++) p.data[i] ^= data[i];
+      p.set.delete(b);
+      if (p.set.size === 0) this._remove(p);
+    }
+  }
+
+  _peel() {
+    let progress = true;
+    while (progress && !this.done) {
+      progress = false;
+      for (const p of [...this.pending]) {
+        if (p.set.size === 1) {
+          const b = [...p.set][0];
+          this._remove(p);
+          this._solve(b, p.data);
+          progress = true;
+        }
+      }
+    }
+  }
+
+  /**
+   * 剝離卡住時的退路：對殘餘的未知塊做 GF(2) 高斯消去。
+   * 純剝離會在還差幾塊時停住，那時再收封包也可能一直卡著；殘餘規模通常很小。
+   * @param {number} maxUnknowns 超過就放棄（消去是 O(n³)）
+   */
+  finish(maxUnknowns = 2000) {
+    if (this.done) return true;
+    const unknown = [];
+    for (let i = 0; i < this.k; i++) if (!this.solved[i]) unknown.push(i);
+    if (unknown.length > maxUnknowns || this.pending.length < unknown.length) return false;
+
+    const col = new Map(unknown.map((b, i) => [b, i]));
+    const n = unknown.length;
+    const words = (n + 31) >> 5;
+    const rows = this.pending.map((p) => {
+      const m = new Uint32Array(words);
+      for (const b of p.set) { const c = col.get(b); m[c >> 5] |= 1 << (c & 31); }
+      return { m, data: p.data.slice() };
+    });
+
+    const pivotRow = new Array(n).fill(-1);
+    let r = 0;
+    for (let c = 0; c < n && r < rows.length; c++) {
+      let sel = -1;
+      for (let i = r; i < rows.length; i++) if ((rows[i].m[c >> 5] >> (c & 31)) & 1) { sel = i; break; }
+      if (sel < 0) continue;
+      [rows[r], rows[sel]] = [rows[sel], rows[r]];
+      for (let i = 0; i < rows.length; i++) {
+        if (i === r || !((rows[i].m[c >> 5] >> (c & 31)) & 1)) continue;
+        for (let w = 0; w < words; w++) rows[i].m[w] ^= rows[r].m[w];
+        for (let j = 0; j < this.blockSize; j++) rows[i].data[j] ^= rows[r].data[j];
+      }
+      pivotRow[c] = r++;
+    }
+
+    for (let c = 0; c < n; c++) if (pivotRow[c] < 0) return false;
+    for (let c = 0; c < n; c++) this._solve(unknown[c], rows[pivotRow[c]].data);
+    return this.done;
+  }
+
+  /** 還原原始資料（需先 done） */
+  recover(length) {
+    if (!this.done) return null;
+    const out = new Uint8Array(this.k * this.blockSize);
+    for (let i = 0; i < this.k; i++) out.set(this.solved[i], i * this.blockSize);
+    return length ? out.subarray(0, length) : out;
+  }
+}
+
+// ═══ ../src/fountain/packet.js ═════════════════════════════════
+// 傳輸封包格式與 CRC。
+//
+// 架構決定：不另外做 FEC（LDPC 之類），改成「CRC 偵錯 → 丟棄壞封包 →
+// 交給噴泉碼補」。這把位元錯誤通道轉成抹除通道，而噴泉碼本來就是為抹除
+// 設計的。少一層編解碼、少一組參數要調，代價只是壞封包的頻寬白費。
+//
+//   封包 = [ seed:3 | payload:P | CRC-16:2 ]
+//
+// seed 決定這個封包混了哪幾塊（收發用同一個 PRNG 推導），所以不必帶索引清單。
+// seed = 0xFFFFFF 保留給 manifest。
+
+const SEED_BYTES = 3;
+const CRC_BYTES = 2;
+const OVERHEAD = SEED_BYTES + CRC_BYTES;
+const MANIFEST_SEED = 0xffffff;
+
+// CRC-16/CCITT-FALSE。查表版，位元組序處理一次算好。
+const CRC_TABLE = (() => {
+  const t = new Uint16Array(256);
+  for (let i = 0; i < 256; i++) {
+    let c = i << 8;
+    for (let j = 0; j < 8; j++) c = (c & 0x8000) ? ((c << 1) ^ 0x1021) & 0xffff : (c << 1) & 0xffff;
+    t[i] = c;
+  }
+  return t;
+})();
+
+function crc16(bytes, from = 0, to = bytes.length) {
+  let c = 0xffff;
+  for (let i = from; i < to; i++) c = ((c << 8) & 0xffff) ^ CRC_TABLE[((c >> 8) ^ bytes[i]) & 0xff];
+  return c;
+}
+
+function packetSize(payloadSize) {
+  return payloadSize + OVERHEAD;
+}
+
+function writePacket(out, offset, seed, payload) {
+  out[offset] = (seed >> 16) & 0xff;
+  out[offset + 1] = (seed >> 8) & 0xff;
+  out[offset + 2] = seed & 0xff;
+  out.set(payload, offset + SEED_BYTES);
+  const end = offset + SEED_BYTES + payload.length;
+  const c = crc16(out, offset, end);
+  out[end] = (c >> 8) & 0xff;
+  out[end + 1] = c & 0xff;
+  return end + CRC_BYTES;
+}
+
+/**
+ * @returns {{seed:number, payload:Uint8Array}|null} CRC 不符時回 null
+ */
+function readPacket(buf, offset, payloadSize) {
+  const end = offset + SEED_BYTES + payloadSize;
+  if (end + CRC_BYTES > buf.length) return null;
+  const want = (buf[end] << 8) | buf[end + 1];
+  if (crc16(buf, offset, end) !== want) return null;
+  return {
+    seed: (buf[offset] << 16) | (buf[offset + 1] << 8) | buf[offset + 2],
+    payload: buf.subarray(offset + SEED_BYTES, end),
+  };
+}
+
+/**
+ * 依照 plan 每符元能載多少 bit，決定封包要跨幾個符元。
+ *
+ * 太小則 5 bytes 的表頭佔比失控；太大則單一位元錯就報銷一大塊頻寬
+ * （BER 3e-4 時，200 bytes 的封包有 38% 機率壞掉，60 bytes 只有 13%）。
+ * 對齊到符元邊界，讓某個符元的突發錯誤只波及一個封包。
+ */
+function choosePacketLayout(bitsPerSymbol, targetBytes = 96) {
+  const bytesPerSymbol = bitsPerSymbol / 8;
+  const symbols = Math.max(1, Math.round(targetBytes / bytesPerSymbol));
+  const totalBytes = Math.floor((symbols * bitsPerSymbol) / 8);
+  const payloadSize = totalBytes - OVERHEAD;
+  if (payloadSize < 8) {
+    // 每符元載得太少，加符元數直到裝得下有意義的內容
+    return choosePacketLayout(bitsPerSymbol, targetBytes * 2);
+  }
+  return { symbols, totalBytes, payloadSize, bitsUsed: totalBytes * 8 };
+}
+
+// ═══ ../src/fountain/manifest.js ═══════════════════════════════
+// 檔案描述資訊（manifest）。
+//
+// 接收端在解碼任何資料之前，必須先知道分段方式、每段的塊數、檔案長度與檔名。
+// 這些資訊放在保留 seed 的封包裡週期性重播 —— 接收端可能在任何時間點加入，
+// 不能假設它收得到第一個封包。重播成本很低（每 16 個封包插一個）。
+//
+//   [ ver:1 | blockSize:2 | segIndex:3 | segCount:3 | segBlocks:3 |
+//     segOffset:6 | fileSize:6 | hash8:8 | nameLen:1 | name:UTF-8 ]
+//
+// 長度欄位用 6 bytes（256 TB）而不是 4 bytes：4 bytes 上限只有 4 GB，
+// 而使用者一開口就是 10 GB 的模型檔 —— 就算那個尺寸實際上傳不完，
+// 也不該讓格式本身先爆掉。
+
+const MANIFEST_VERSION = 2;
+const FIXED = 1 + 2 + 3 + 3 + 3 + 6 + 6 + 8 + 1;
+
+const w24 = (o, a, v) => { a[o] = (v >> 16) & 0xff; a[o + 1] = (v >> 8) & 0xff; a[o + 2] = v & 0xff; };
+const r24 = (o, a) => (a[o] << 16) | (a[o + 1] << 8) | a[o + 2];
+// 6 bytes 超過 32-bit，位元運算會溢位，所以高位用乘法組回來
+const w48 = (o, a, v) => {
+  const hi = Math.floor(v / 0x100000000);
+  a[o] = (hi >> 8) & 0xff; a[o + 1] = hi & 0xff;
+  const lo = v >>> 0;
+  a[o + 2] = (lo >>> 24) & 0xff; a[o + 3] = (lo >>> 16) & 0xff;
+  a[o + 4] = (lo >>> 8) & 0xff; a[o + 5] = lo & 0xff;
+};
+const r48 = (o, a) =>
+  ((a[o] << 8) | a[o + 1]) * 0x100000000 +
+  (((a[o + 2] << 24) >>> 0) + (a[o + 3] << 16) + (a[o + 4] << 8) + a[o + 5]);
+
+function encodeManifest(m) {
+  const nameBytes = new TextEncoder().encode(m.name ?? '');
+  const trimmed = nameBytes.subarray(0, 255);
+  const out = new Uint8Array(FIXED + trimmed.length);
+  out[0] = MANIFEST_VERSION;
+  out[1] = (m.blockSize >> 8) & 0xff; out[2] = m.blockSize & 0xff;
+  w24(3, out, m.segIndex);
+  w24(6, out, m.segCount);
+  w24(9, out, m.segBlocks);
+  w48(12, out, m.segOffset);
+  w48(18, out, m.fileSize);
+  out.set(m.hash8.subarray(0, 8), 24);
+  out[32] = trimmed.length;
+  out.set(trimmed, 33);
+  return out;
+}
+
+function decodeManifest(buf) {
+  if (buf.length < FIXED) return null;
+  if (buf[0] !== MANIFEST_VERSION) return null;
+  const blockSize = (buf[1] << 8) | buf[2];
+  const segIndex = r24(3, buf);
+  const segCount = r24(6, buf);
+  const segBlocks = r24(9, buf);
+  const segOffset = r48(12, buf);
+  const fileSize = r48(18, buf);
+  const hash8 = buf.slice(24, 32);
+  const nameLen = buf[32];
+  if (33 + nameLen > buf.length) return null;
+  const name = new TextDecoder().decode(buf.subarray(33, 33 + nameLen));
+  if (blockSize <= 0 || segBlocks <= 0 || fileSize <= 0) return null;
+  if (segCount <= 0 || segIndex >= segCount) return null;
+  if (segOffset >= fileSize) return null;
+  return { blockSize, segIndex, segCount, segBlocks, segOffset, fileSize, hash8, name };
+}
+
+function manifestOverhead() { return FIXED; }
+
+// 檔名太長會塞不進一個封包。截斷但保留副檔名 —— 副檔名決定接收端怎麼開它。
+function fitName(name, payloadSize) {
+  const enc = new TextEncoder();
+  if (FIXED + enc.encode(name).length <= payloadSize) return name;
+  const budget = Math.max(1, payloadSize - FIXED);
+  const dot = name.lastIndexOf('.');
+  const ext = dot > 0 ? name.slice(dot) : '';
+  const extLen = enc.encode(ext).length;
+  let base = name.slice(0, dot > 0 ? dot : name.length);
+  while (base.length > 1 && enc.encode(base).length + extLen > budget) base = base.slice(0, -1);
+  return base + ext;
+}
+
+// ═══ ../src/transfer/crypto.js ═════════════════════════════════
+// 以密碼加密傳輸內容。
+//
+// 為什麼不是「輸入密碼才顯示介面」那種閘門：這是純前端的靜態網頁，
+// 程式碼公開可讀，任何閘門的判斷式和密碼都寫在原始碼裡，
+// 按 F12、關掉 JS、或直接下載檔案都能繞過 —— 那是零安全性的裝飾。
+//
+// 真正有意義的是加密內容本身：沒有密碼的人即使跑同一個工具、
+// 即使錄下全部音訊，也解不出檔案。而且這同時達成「不知道密碼就用不了」。
+//
+// 用 WebCrypto 而不是自己實作：AES 與 PBKDF2 自己寫太容易出錯，
+// 而瀏覽器與 Node 都內建同一套 API，收發兩端和測試可以跑同一份程式碼。
+//
+//   明文  = [ nameLen:1 | 檔名 UTF-8 | 檔案內容 ]
+//   傳輸  = [ magic:4 "WSE1" | salt:16 | iv:12 | AES-GCM 密文（含 16 bytes 驗證標籤）]
+//
+// 檔名放在密文裡面，不放 manifest —— 否則檔名會外洩。
+
+const MAGIC = new Uint8Array([0x57, 0x53, 0x45, 0x31]); // "WSE1"
+const SALT_BYTES = 16;
+const IV_BYTES = 12;
+const HEADER = MAGIC.length + SALT_BYTES + IV_BYTES;
+const PBKDF2_ITERATIONS = 210000;   // OWASP 2023 對 PBKDF2-HMAC-SHA256 的建議值
+
+const ENCRYPTED_NAME = 'encrypted.wsenc';
+
+const subtle = () => {
+  const c = globalThis.crypto?.subtle;
+  if (!c) throw new Error('這個環境沒有 WebCrypto（需要安全來源：https、localhost 或 file://）');
+  return c;
+};
+
+async function deriveKey(password, salt) {
+  const base = await subtle().importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveKey']);
+  return subtle().deriveKey(
+    { name: 'PBKDF2', salt, iterations: PBKDF2_ITERATIONS, hash: 'SHA-256' },
+    base,
+    { name: 'AES-GCM', length: 256 },
+    false,
+    ['encrypt', 'decrypt'],
+  );
+}
+
+/**
+ * @param {string} password
+ * @param {string} name 原始檔名（會被一起加密）
+ * @param {Uint8Array} bytes
+ * @returns {Promise<Uint8Array>} 可直接餵給噴泉碼的密文封包
+ */
+async function encryptFile(password, name, bytes) {
+  const nameBytes = new TextEncoder().encode(name).subarray(0, 255);
+  const plain = new Uint8Array(1 + nameBytes.length + bytes.length);
+  plain[0] = nameBytes.length;
+  plain.set(nameBytes, 1);
+  plain.set(bytes, 1 + nameBytes.length);
+
+  const salt = crypto.getRandomValues(new Uint8Array(SALT_BYTES));
+  const iv = crypto.getRandomValues(new Uint8Array(IV_BYTES));
+  const key = await deriveKey(password, salt);
+  const ct = new Uint8Array(await subtle().encrypt({ name: 'AES-GCM', iv }, key, plain));
+
+  const out = new Uint8Array(HEADER + ct.length);
+  out.set(MAGIC, 0);
+  out.set(salt, MAGIC.length);
+  out.set(iv, MAGIC.length + SALT_BYTES);
+  out.set(ct, HEADER);
+  return out;
+}
+
+function isEncrypted(bytes) {
+  return bytes.length > HEADER && MAGIC.every((v, i) => bytes[i] === v);
+}
+
+/**
+ * @returns {Promise<{name:string, bytes:Uint8Array}>}
+ * @throws 密碼錯誤時拋出（AES-GCM 的驗證標籤會擋下來，不會回傳垃圾）
+ */
+async function decryptFile(password, blob) {
+  if (!isEncrypted(blob)) throw new Error('這不是加密過的內容');
+  const salt = blob.subarray(MAGIC.length, MAGIC.length + SALT_BYTES);
+  const iv = blob.subarray(MAGIC.length + SALT_BYTES, HEADER);
+  const key = await deriveKey(password, salt);
+
+  let plain;
+  try {
+    plain = new Uint8Array(await subtle().decrypt({ name: 'AES-GCM', iv }, key, blob.subarray(HEADER)));
+  } catch {
+    // GCM 的驗證標籤不符 —— 幾乎必然是密碼錯，也可能是資料被竄改
+    throw new Error('密碼錯誤，或資料已損毀');
+  }
+
+  const nameLen = plain[0];
+  return {
+    name: new TextDecoder().decode(plain.subarray(1, 1 + nameLen)),
+    bytes: plain.subarray(1 + nameLen),
+  };
+}
+
+// 加密會讓內容變大：4+16+12 的表頭加上 16 bytes 的 GCM 驗證標籤
+const CRYPTO_OVERHEAD = HEADER + 16;
+
+// ═══ ../src/transfer/session.js ════════════════════════════════
+// 檔案傳輸工作階段：把噴泉碼接到 OFDM modem 上，並把檔案切成段。
+//
+// 訊框結構（不斷重複）：
+//   [ chirp+guard ][ probe ×5 ][ 資料符元 ×D ]
+//
+// 每個訊框都重送前導與 probe，成本約 7%，換到兩件事：
+//   1. 接收端可以在任何時間點加入，不必從頭聽起
+//   2. 每個訊框重新估一次通道，手機或環境稍有移動也能跟上
+//
+// ── 為什麼一定要分段 ──
+//
+// LT 噴泉碼的塊數 K 不能無限大：
+//   · 剝離解碼在 K 很大時退化，高斯消去退路是 O(n³)
+//   · 接收端要為 K 個塊各留一個 Uint8Array，物件開銷比資料本身還大
+//   · 10 GB 直接編會得到 K = 1.23 億，光指標陣列就 1 GB
+// 所以檔案先切成固定大小的段，每段自成一個噴泉工作階段，K 控制在一萬出頭
+// （RaptorQ 的 RFC 上限 56403 也是同樣理由）。
+//
+// 分段的附帶效果是續傳：段是最小的完成單位，收完一段就永久有效，
+// 中斷後只要接著沒收完的那些段跑。
+//
+// 調變可選 QPSK 或 BPSK（見 MODULATION）。不做自適應 bit-loading 是因為
+// 那需要接收端把通道回報給發送端，而目前是單向廣播。
+
+
+
+
+
+
+
+
+const TARGET_FRAME_SEC = 3;
+const MANIFEST_EVERY = 16;        // 每這麼多個封包插一個 manifest
+// QPSK（2 bit）或 BPSK（1 bit）。BPSK 速率減半，但門檻低 4.8 dB ——
+// 當喇叭的可聽互調逼得輸出必須調低時，這是唯一還能維持鏈路的辦法。
+const MODULATION = { qpsk: 2, bpsk: 1 };
+const DEFAULT_SEGMENT_BYTES = 1024 * 1024;
+const SEGMENT_BUDGET = 1.8;       // 沒有 ACK 時，每段送到這個倍率就換下一段
+
+function sessionLayout(band, mod = 'qpsk') {
+  const plan = makePlan({ band, fallbackBits: MODULATION[mod] ?? 2 });
+  const layout = choosePacketLayout(plan.bitsPerSymbol);
+  const packetsPerFrame = Math.max(1, Math.round((TARGET_FRAME_SEC * SR) / SYM / layout.symbols));
+  const dataSymbols = packetsPerFrame * layout.symbols;
+  const frameSamples = PREAMBLE_LEN + (PROBE_SYMS + dataSymbols) * SYM;
+  return {
+    plan, layout, packetsPerFrame, dataSymbols, frameSamples,
+    frameSec: frameSamples / SR,
+    payloadBps: (packetsPerFrame * layout.payloadSize * SR) / frameSamples,
+  };
+}
+
+function planSegments(fileSize, payloadSize, segmentBytes = DEFAULT_SEGMENT_BYTES) {
+  // 段長取 payloadSize 的整數倍，讓每段的塊數乾淨、最後一塊不用跨段補零
+  const perSeg = Math.max(payloadSize, Math.floor(segmentBytes / payloadSize) * payloadSize);
+  const segCount = Math.max(1, Math.ceil(fileSize / perSeg));
+  return { perSeg, segCount, blocksPerSeg: Math.ceil(perSeg / payloadSize) };
+}
+
+// ---------------------------------------------------------------- 發送
+
+class SendSession {
+  /**
+   * @param {{band:string, name:string, bytes:Uint8Array, segmentBytes?:number}} opts
+   */
+  constructor({ band, mod = 'qpsk', name, bytes, segmentBytes = DEFAULT_SEGMENT_BYTES }) {
+    Object.assign(this, sessionLayout(band, mod));
+    this.band = band;
+    this.mod = mod;
+    this.bytes = bytes;
+    this.hash = sha256(bytes);
+    this.name = fitName(name || 'file.bin', this.layout.payloadSize);
+
+    const seg = planSegments(bytes.length, this.layout.payloadSize, segmentBytes);
+    this.perSeg = seg.perSeg;
+    this.segCount = seg.segCount;
+
+    this.segIndex = 0;
+    this.acked = new Set();          // 由 ACK 標記已完成的段（目前尚無 ACK 通道）
+    this.packetsInSeg = 0;
+    this.packetCount = 0;
+    this.frameCount = 0;
+    this.payloadBytesSent = 0;
+
+    this.frameBytes = new Uint8Array(this.packetsPerFrame * this.layout.totalBytes);
+    this.scratch = new Uint8Array(this.layout.payloadSize);
+    this._openSegment(0);
+  }
+
+  _openSegment(i) {
+    this.segIndex = i;
+    this.segOffset = i * this.perSeg;
+    const end = Math.min(this.segOffset + this.perSeg, this.bytes.length);
+    this.encoder = new Encoder(this.bytes.subarray(this.segOffset, end), this.layout.payloadSize);
+    this.packetsInSeg = 0;
+    this.manifest = encodeManifest({
+      blockSize: this.layout.payloadSize,
+      segIndex: i,
+      segCount: this.segCount,
+      segBlocks: this.encoder.k,
+      segOffset: this.segOffset,
+      fileSize: this.bytes.length,
+      hash8: this.hash,
+      name: this.name,
+    });
+  }
+
+  /** 標記某段已被接收端收妥（ACK 用） */
+  markAcked(i) {
+    this.acked.add(i);
+    if (i === this.segIndex) this._advance();
+  }
+
+  _advance() {
+    for (let n = 1; n <= this.segCount; n++) {
+      const i = (this.segIndex + n) % this.segCount;
+      if (!this.acked.has(i)) { this._openSegment(i); return; }
+    }
+    this.allAcked = true;
+  }
+
+  get segmentProgress() { return this.packetsInSeg / (this.encoder.k * SEGMENT_BUDGET); }
+
+  /** 產生下一個訊框的音訊 */
+  nextFrame() {
+    const { totalBytes, payloadSize } = this.layout;
+    for (let i = 0; i < this.packetsPerFrame; i++) {
+      const off = i * totalBytes;
+      if (this.packetCount % MANIFEST_EVERY === 0) {
+        this.scratch.fill(0);
+        this.scratch.set(this.manifest.subarray(0, payloadSize));
+        writePacket(this.frameBytes, off, MANIFEST_SEED, this.scratch);
+      } else {
+        const seed = this.encoder.nextSeed();
+        writePacket(this.frameBytes, off, seed, this.encoder.encode(seed, this.scratch));
+        this.packetsInSeg++;
+        this.payloadBytesSent += payloadSize;
+        // 沒有 ACK 時只能靠預算換段：送滿 1.8×K 通常遠超過接收端所需的 1.1–1.6×K
+        if (this.segCount > 1 && this.packetsInSeg >= this.encoder.k * SEGMENT_BUDGET) this._advance();
+      }
+      this.packetCount++;
+    }
+    this.frameCount++;
+    return modulate(this.frameBytes, this.plan).samples;
+  }
+
+  stats() {
+    return {
+      segIndex: this.segIndex, segCount: this.segCount,
+      acked: this.acked.size,
+      frames: this.frameCount,
+      packets: this.packetCount,
+      bytesSent: this.payloadBytesSent,
+      fileSize: this.bytes.length,
+      segRatio: this.packetsInSeg / this.encoder.k,
+    };
+  }
+}
+
+// ---------------------------------------------------------------- 接收
+
+class ReceiveSession {
+  constructor({ band, mod = 'qpsk' }) {
+    Object.assign(this, sessionLayout(band, mod));
+    this.band = band;
+    this.mod = mod;
+    this.chirp = makeChirp(this.plan.spec.fLow, this.plan.spec.fHigh);
+
+    this.buf = new Float32Array(this.frameSamples * 4);
+    this.len = 0;             // buf 內有效樣本數
+    this.base = 0;            // buf[0] 對應的全域樣本序號
+    this.searchFrom = 0;      // 全域座標
+
+    this.file = null;         // {name, fileSize, segCount, hash8, blockSize}
+    this.segments = new Map();// segIndex → {decoder, bytes|null, offset, blocks}
+    this.framesSeen = 0;
+    this.framesDecoded = 0;
+    this.packetsGood = 0;
+    this.packetsBad = 0;
+    this.bytesRecovered = 0;
+    this.lastSnrDb = null;
+    this.lastRhoPpm = null;
+    this.result = null;
+    this.hashOk = null;
+  }
+
+  get done() { return this.result !== null; }
+
+  get progress() {
+    if (!this.file) return 0;
+    let done = 0;
+    for (const s of this.segments.values()) done += s.bytes ? 1 : (s.decoder?.progress ?? 0);
+    return done / this.file.segCount;
+  }
+
+  get completedSegments() {
+    let n = 0;
+    for (const s of this.segments.values()) if (s.bytes) n++;
+    return n;
+  }
+
+  /** 已完成的段索引，供 ACK 回報用 */
+  ackList() {
+    return [...this.segments.entries()].filter(([, s]) => s.bytes).map(([i]) => i);
+  }
+
+  /** 餵入新錄到的音訊 */
+  push(samples) {
+    this._append(samples);
+    let advanced = false;
+    while (this._tryFrame()) advanced = true;
+    return advanced;
+  }
+
+  _append(samples) {
+    if (this.len + samples.length > this.buf.length) {
+      // 先丟掉已經處理過的部分，不夠再擴充
+      const keepFrom = Math.max(0, this.searchFrom - this.base - PREAMBLE_LEN);
+      if (keepFrom > 0) {
+        this.buf.copyWithin(0, keepFrom, this.len);
+        this.len -= keepFrom;
+        this.base += keepFrom;
+      }
+      if (this.len + samples.length > this.buf.length) {
+        const grown = new Float32Array(Math.max(this.buf.length * 2, this.len + samples.length));
+        grown.set(this.buf.subarray(0, this.len));
+        this.buf = grown;
+      }
+    }
+    this.buf.set(samples, this.len);
+    this.len += samples.length;
+  }
+
+  _tryFrame() {
+    if (this.done) return false;
+    const from = Math.max(0, this.searchFrom - this.base);
+    if (this.len - from < this.frameSamples + PREAMBLE_LEN) return false;
+
+    const window = this.buf.subarray(from, this.len);
+    const sync = findPreamble(window, this.chirp, 0, Math.min(window.length, this.frameSamples));
+    if (sync.index < 0 || sync.ratio < 8) {
+      // 這段沒有前導，跳過大半再找（保留重疊，避免切在前導中間）
+      this.searchFrom += Math.max(1, this.frameSamples - PREAMBLE_LEN * 2);
+      return true;
+    }
+
+    const start = from + sync.index;
+    if (this.len - start < this.frameSamples) return false;   // 訊框還沒收完
+
+    this.framesSeen++;
+    const frame = this.buf.subarray(start, start + this.frameSamples);
+    this.searchFrom = this.base + start + this.frameSamples - PREAMBLE_LEN;
+
+    let r;
+    try {
+      r = demodulate(frame, this.plan, { symbols: this.dataSymbols });
+    } catch { return true; }
+    if (!r.ok) return true;
+
+    this.framesDecoded++;
+    this.lastSnrDb = r.snrDb;
+    this.lastRhoPpm = r.rhoPpm;
+    this._consumePackets(r.bytes);
+    return true;
+  }
+
+  _consumePackets(bytes) {
+    const { totalBytes, payloadSize } = this.layout;
+    let current = null;
+
+    for (let i = 0; i < this.packetsPerFrame; i++) {
+      const p = readPacket(bytes, i * totalBytes, payloadSize);
+      if (!p) { this.packetsBad++; continue; }
+      this.packetsGood++;
+
+      if (p.seed === MANIFEST_SEED) {
+        const m = decodeManifest(p.payload);
+        if (m && m.blockSize === payloadSize) current = this._applyManifest(m);
+        continue;
+      }
+      // 資料封包本身不帶段號 —— 靠同一訊框稍早的 manifest 決定歸屬。
+      // 這是刻意的取捨：段號要 3 bytes，而封包只有 87 bytes 酬載，
+      // 每個封包都帶等於多付 3.4% 的固定成本。manifest 每 16 個封包重播一次，
+      // 一個訊框內必定至少出現一次，所以不會沒有歸屬。
+      if (current && !current.bytes) {
+        current.decoder.add(p.seed, p.payload);
+        if (!current.decoder.done && current.decoder.received > current.decoder.k * 1.3) {
+          current.decoder.finish(4000);
+        }
+        if (current.decoder.done) this._sealSegment(current);
+      }
+    }
+    if (this.file && this.completedSegments === this.file.segCount && !this.result) this._finalise();
+  }
+
+  _applyManifest(m) {
+    if (!this.file) {
+      this.file = {
+        name: m.name, fileSize: m.fileSize, segCount: m.segCount,
+        hash8: m.hash8, blockSize: m.blockSize,
+      };
+    } else if (this.file.fileSize !== m.fileSize || !this.file.hash8.every((v, i) => v === m.hash8[i])) {
+      return null;              // 換了別的檔案，忽略
+    }
+    let s = this.segments.get(m.segIndex);
+    if (!s) {
+      s = { decoder: new Decoder(m.segBlocks, m.blockSize), bytes: null, offset: m.segOffset, blocks: m.segBlocks };
+      this.segments.set(m.segIndex, s);
+    }
+    return s;
+  }
+
+  _sealSegment(s) {
+    const want = Math.min(s.blocks * this.file.blockSize, this.file.fileSize - s.offset);
+    s.bytes = s.decoder.recover(want);
+    s.decoder = null;           // 釋放 pending 封包與剝離結構
+    this.bytesRecovered += s.bytes.length;
+  }
+
+  _finalise() {
+    const out = new Uint8Array(this.file.fileSize);
+    for (const [, s] of this.segments) out.set(s.bytes, s.offset);
+    const h = sha256(out);
+    this.hashOk = h.subarray(0, 8).every((v, i) => v === this.file.hash8[i]);
+    this.result = { name: this.file.name, bytes: out, hashOk: this.hashOk };
+  }
+
+  stats() {
+    const seg = [...this.segments.values()];
+    return {
+      name: this.file?.name ?? null,
+      fileSize: this.file?.fileSize ?? 0,
+      segCount: this.file?.segCount ?? 0,
+      segDone: this.completedSegments,
+      bytesRecovered: this.bytesRecovered,
+      progress: this.progress,
+      packetsGood: this.packetsGood,
+      packetsBad: this.packetsBad,
+      framesDecoded: this.framesDecoded,
+      framesSeen: this.framesSeen,
+      snrDb: this.lastSnrDb,
+      rhoPpm: this.lastRhoPpm,
+      activeRatio: seg.find((s) => s.decoder)?.decoder?.received / (seg.find((s) => s.decoder)?.decoder?.k || 1),
+    };
+  }
+}
+
+// ═══ worklet-src.js ════════════════════════════════════════════
+// AudioWorklet 的原始碼以字串保存，執行期用 Blob URL 掛載。
+//
+// 這是為了 file:// 可攜性：addModule() 傳檔案路徑時會走 fetch，
+// 在 file:// 下必定被 CORS 擋死。Blob URL 繼承頁面來源，不受此限。
+//
+// 另外絕對不能用 MediaRecorder 擷取 —— 它會走 Opus 編碼，
+// 在 20kHz 附近就被低通砍掉，整個超音波量測會歸零。
+
+const WORKLET_SRC = `
+const CHUNK = 4096;
+
+class RecorderProcessor extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.buf = new Float32Array(CHUNK);
+    this.fill = 0;
+    this.running = true;
+    this.port.onmessage = (e) => {
+      if (e.data === 'stop') {
+        if (this.fill > 0) {
+          this.port.postMessage(this.buf.slice(0, this.fill));
+          this.fill = 0;
+        }
+        this.running = false;
+      }
+    };
+  }
+
+  process(inputs) {
+    if (!this.running) return false;
+    const ch = inputs[0] && inputs[0][0];
+    if (!ch) return true;
+    for (let i = 0; i < ch.length; i++) {
+      this.buf[this.fill++] = ch[i];
+      if (this.fill === CHUNK) {
+        this.port.postMessage(this.buf.slice(0));
+        this.fill = 0;
+      }
+    }
+    return true;
+  }
+}
+
+registerProcessor('recorder', RecorderProcessor);
+`;
+
+// ═══ app.js ════════════════════════════════════════════════════
+// Step 2b：實際的檔案傳輸介面。
+//
+// 發送端把訊框連續排進音訊時間軸（不是一次做一大塊 buffer）——
+// 噴泉碼是無限串流，沒有「整段」可以預先算，而且要能隨時停。
+// 接收端在音訊執行緒收原始 PCM，解調則排在主執行緒分次做：
+// 實機量到解調有 12× 即時餘裕，不需要 Worker 也追得上。
+const LOOKAHEAD_SEC = 6;        // 音訊排程的前置量
+
+const $ = (id) => document.getElementById(id);
+const log = (m) => { const e = $('log'); e.textContent += m + '\n'; e.scrollTop = e.scrollHeight; };
+const fmtBytes = (n) => (n < 1024 ? `${n} B` : n < 1048576 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1048576).toFixed(2)} MB`);
+const fmtSec = (s) => (s < 90 ? `${s.toFixed(0)} 秒` : s < 5400 ? `${(s / 60).toFixed(1)} 分` : `${(s / 3600).toFixed(1)} 小時`);
+
+const state = { ctx: null, stream: null, node: null, tx: null, rx: null, timer: null, file: null, t0: 0 };
+
+const currentBand = () => document.querySelector('input[name=band]:checked').value;
+const currentMod = () => document.querySelector('input[name=mod]:checked').value;
+const currentPw = () => $('pw').value;
+
+function diagnose() {
+  const rows = [
+    ['安全來源', window.isSecureContext ? '✓' : '✗ 麥克風會被擋', window.isSecureContext ? 'ok' : 'bad'],
+    ['getUserMedia', navigator.mediaDevices?.getUserMedia ? '✓' : '✗', navigator.mediaDevices?.getUserMedia ? 'ok' : 'bad'],
+    ['AudioWorklet', typeof AudioWorkletNode !== 'undefined' ? '✓' : '△ 退用 ScriptProcessor',
+      typeof AudioWorkletNode !== 'undefined' ? 'ok' : 'warn'],
+  ];
+  $('diag').innerHTML = rows.map(([k, v, c]) => `<div class="drow ${c}"><span>${k}</span><b>${v}</b></div>`).join('');
+}
+
+function describeBand() {
+  const s = sessionLayout(currentBand(), currentMod());
+  const eff = s.payloadBps / 1.15;
+  $('bandInfo').innerHTML =
+    `<div class="drow info"><span>訊框</span><b>${s.frameSec.toFixed(2)} s / ${s.packetsPerFrame} 封包 ` +
+    `(${s.layout.payloadSize} B 酬載)</b></div>` +
+    `<div class="drow info"><span>預估速率</span><b>${eff.toFixed(0)} B/s ` +
+    `— 100 KB 約 ${fmtSec(102400 / eff)}</b></div>`;
+  if (state.file) showEstimate();
+}
+
+function showEstimate() {
+  const s = sessionLayout(currentBand(), currentMod());
+  const eff = s.payloadBps / 1.15;
+  $('fileInfo').textContent =
+    `${state.file.name}（${fmtBytes(state.file.bytes.length)}）→ 預估 ${fmtSec(state.file.bytes.length / eff)}`;
+}
+
+// ---------------------------------------------------------------- 發送
+
+async function startSend() {
+  if (!state.file) { log('✗ 請先選檔案。'); return; }
+  const pw = currentPw();
+  if (!pw) { log('✗ 請先輸入密碼。接收端必須輸入相同的密碼才解得開。'); return; }
+
+  log(`加密中…（PBKDF2 210k 迭代，約 0.1 秒）`);
+  let payload;
+  try {
+    payload = await encryptFile(pw, state.file.name, state.file.bytes);
+  } catch (e) { log('✗ 加密失敗：' + e.message); return; }
+  log(`已加密：${fmtBytes(state.file.bytes.length)} → ${fmtBytes(payload.length)}（含 salt/iv/驗證標籤）`);
+  const ctx = new AudioContext({ sampleRate: SR, latencyHint: 'playback' });
+  await ctx.resume();
+  if (ctx.sampleRate !== SR) {
+    log(`✗ AudioContext 是 ${ctx.sampleRate} Hz，需要 ${SR}。這台裝置不能當發送端。`);
+    await ctx.close();
+    return;
+  }
+  state.ctx = ctx;
+
+  // 檔名放在密文裡，manifest 只帶一個固定名稱 —— 否則檔名會外洩
+  const tx = new SendSession({ band: currentBand(), mod: currentMod(), name: ENCRYPTED_NAME, bytes: payload });
+  state.tx = tx;
+  log(`開始傳送（原始檔名已加密，不會出現在音訊裡）`);
+  log(`分成 ${tx.segCount} 段，每段 ${fmtBytes(tx.perSeg)}（K=${tx.encoder.k}）`);
+  log(`每訊框 ${tx.packetsPerFrame} 封包 / ${tx.frameSec.toFixed(2)} s`);
+  log(`SHA-256 ${hex(tx.hash).slice(0, 16)}…`);
+  log('音量開到最大，手機貼在喇叭上 2–3 cm。噴泉碼會一直送到你按停止為止。');
+
+  const gainDb = Number(document.querySelector('input[name=txgain]:checked').value);
+  state.txGain = Math.pow(10, gainDb / 20);
+  if (gainDb !== 0) log(`輸出增益 ${gainDb} dB（降低驅動位準可減少喇叭的可聽互調失真）`);
+
+  const gain = ctx.createGain();
+  gain.connect(ctx.destination);
+  state.gain = gain;
+
+  let nextTime = ctx.currentTime + 0.15;
+  const pump = () => {
+    if (!state.tx) return;
+    // 排程到 currentTime + LOOKAHEAD 為止。噴泉碼是無限串流，
+    // 只能邊播邊產生，不能先做一大塊。
+    while (nextTime < ctx.currentTime + LOOKAHEAD_SEC) {
+      const samples = tx.nextFrame();
+      if (state.txGain !== 1) for (let i = 0; i < samples.length; i++) samples[i] *= state.txGain;
+      const buf = ctx.createBuffer(1, samples.length, SR);
+      buf.copyToChannel(samples, 0);
+      const src = ctx.createBufferSource();
+      src.buffer = buf;
+      src.connect(gain);
+      src.start(nextTime);
+      nextTime += samples.length / SR;
+    }
+    renderTx(tx);
+  };
+  state.t0 = performance.now();
+  pump();
+  state.timer = setInterval(pump, 1000);
+
+  $('sendStart').disabled = true;
+  $('sendStop').disabled = false;
+}
+
+function renderTx(tx) {
+  const st = tx.stats();
+  const secs = (performance.now() - state.t0) / 1000;
+  const rate = secs > 0 ? st.bytesSent / secs : 0;
+  $('txProgress').innerHTML =
+    `<div class="drow info"><span>已上線</span><b>${fmtBytes(st.bytesSent)}　` +
+    `${rate.toFixed(0)} B/s　已跑 ${fmtSec(secs)}</b></div>` +
+    (st.segCount > 1
+      ? `<div class="drow info"><span>目前段</span><b>第 ${st.segIndex + 1} / ${st.segCount} 段　` +
+        `本段已送 ${st.segRatio.toFixed(2)} × K</b></div>`
+      : `<div class="drow info"><span>本段</span><b>已送 ${st.segRatio.toFixed(2)} × K` +
+        `（接收端約需 1.1–1.6 × K）</b></div>`) +
+    `<div class="drow info"><span>訊框 / 封包</span><b>${st.frames} / ${st.packets}</b></div>`;
+}
+
+async function stopSend() {
+  clearInterval(state.timer);
+  state.timer = null;
+  state.tx = null;
+  if (state.gain) { state.gain.gain.setValueAtTime(0, state.ctx.currentTime); }
+  await new Promise((r) => setTimeout(r, 100));
+  if (state.ctx) { await state.ctx.close(); state.ctx = null; }
+  $('sendStart').disabled = false;
+  $('sendStop').disabled = true;
+  log('傳送停止。');
+}
+
+// ---------------------------------------------------------------- 接收
+
+async function makeRecorder(ctx, onChunk) {
+  if (typeof AudioWorkletNode !== 'undefined') {
+    // file:// 是不透明來源，blob URL 會變成 blob:null/… 被 addModule 拒絕；
+    // data: URL 兩種來源都可用。
+    for (const url of [
+      'data:text/javascript,' + encodeURIComponent(WORKLET_SRC),
+      URL.createObjectURL(new Blob([WORKLET_SRC], { type: 'text/javascript' })),
+    ]) {
+      try {
+        await ctx.audioWorklet.addModule(url);
+        const n = new AudioWorkletNode(ctx, 'recorder');
+        n.port.onmessage = (e) => onChunk(e.data);
+        return { node: n, worklet: true };
+      } catch { /* 換下一個來源 */ }
+      finally { if (url.startsWith('blob:')) URL.revokeObjectURL(url); }
+    }
+  }
+  const n = ctx.createScriptProcessor(4096, 1, 1);
+  n.onaudioprocess = (e) => onChunk(e.inputBuffer.getChannelData(0).slice(0));
+  return { node: n, worklet: false };
+}
+
+// 麥克風失敗的原因分辨。最常見的是桌面 Chrome 擋掉 file:// 的媒體存取 ——
+// 錯誤名稱只寫 NotAllowedError，完全看不出該怎麼辦，所以這裡直接講解法。
+// （Android Chrome 反而允許 file://，實測過。）
+function micError(e) {
+  log(`✗ 麥克風失敗：${e.name}`);
+  const isFile = location.protocol === 'file:';
+  if (e.name === 'NotAllowedError') {
+    if (isFile) {
+      log('  桌面版 Chrome 會擋掉 file:// 的媒體存取。改用 localhost：');
+      log('    cd 專案目錄 && python serve.py');
+      log('    然後開 http://localhost:8000/' + location.pathname.split('/').pop());
+      log('  （Android Chrome 允許 file://，手機端不用改。）');
+    } else {
+      log('  權限被拒。點網址列左側的圖示 → 網站設定 → 麥克風 → 允許，然後重新整理。');
+    }
+  } else if (e.name === 'NotFoundError') {
+    log('  找不到麥克風裝置。確認系統有可用的錄音裝置且沒有被停用。');
+  } else if (e.name === 'NotReadableError') {
+    log('  麥克風被其他程式佔用（會議軟體、錄音程式），關掉它再試。');
+  } else if (e.name === 'OverconstrainedError') {
+    log(`  裝置無法滿足要求的參數（${e.constraint ?? '未知'}）。`);
+  } else {
+    log(`  ${e.message}`);
+  }
+}
+
+async function startReceive() {
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 1, sampleRate: SR },
+    });
+  } catch (e) { micError(e); return; }
+  state.stream = stream;
+
+  const st = stream.getAudioTracks()[0].getSettings();
+  for (const k of ['echoCancellation', 'noiseSuppression', 'autoGainControl']) {
+    if (st[k] === true) log(`⚠ ${k} 沒關成功，高頻會被處理掉。`);
+  }
+
+  const ctx = new AudioContext({ sampleRate: SR });
+  await ctx.resume();
+  state.ctx = ctx;
+  if (ctx.sampleRate !== SR) log(`⚠ AudioContext 是 ${ctx.sampleRate} Hz，解調會偏移。`);
+
+  const rx = new ReceiveSession({ band: currentBand(), mod: currentMod() });
+  state.rx = rx;
+  state.t0 = performance.now();
+  const queue = [];
+
+  const rec = await makeRecorder(ctx, (chunk) => queue.push(chunk));
+  const mute = ctx.createGain();
+  mute.gain.value = 0;
+  ctx.createMediaStreamSource(stream).connect(rec.node).connect(mute).connect(ctx.destination);
+  state.node = rec.node;
+  state.worklet = rec.worklet;
+
+  log(`開始接收（${currentBand()} / ${currentMod()}）。解調排在主執行緒分次做 —— 實機有 12× 即時餘裕。`);
+
+  // 解調很吃 CPU，排在計時器裡分次做，避免卡住 UI；
+  // 錄音本身跑在音訊執行緒，不受影響。
+  state.timer = setInterval(() => {
+    if (!state.rx) return;
+    while (queue.length) rx.push(queue.shift());
+    renderProgress();
+    if (rx.done) finishReceive();
+  }, 250);
+
+  $('recvStart').disabled = true;
+  $('recvStop').disabled = false;
+}
+
+function renderProgress() {
+  const rx = state.rx;
+  if (!rx) return;
+  const st = rx.stats();
+  const secs = (performance.now() - state.t0) / 1000;
+  const el = $('rxProgress');
+
+  if (!st.name) {
+    el.innerHTML = `<div class="drow info"><span>狀態</span><b>等待檔案資訊…` +
+      `（已聽 ${fmtSec(secs)}，解出 ${st.framesDecoded}/${st.framesSeen} 訊框）</b></div>`;
+    return;
+  }
+
+  const pct = st.progress * 100;
+  const rate = secs > 0 ? st.bytesRecovered / secs : 0;
+  const remain = st.fileSize - st.bytesRecovered;
+  const eta = rate > 0 && remain > 0 ? remain / rate : null;
+  $('bar').style.width = `${Math.min(100, pct)}%`;
+
+  el.innerHTML =
+    `<div class="drow info"><span>檔案</span><b>${st.name}（${fmtBytes(st.fileSize)}）</b></div>` +
+    `<div class="drow info"><span>已還原</span><b>${fmtBytes(st.bytesRecovered)} / ${fmtBytes(st.fileSize)}　` +
+    `${pct.toFixed(1)}%</b></div>` +
+    `<div class="drow info"><span>速率</span><b>${rate.toFixed(0)} B/s　已聽 ${fmtSec(secs)}` +
+    `${eta !== null ? `　剩餘約 ${fmtSec(eta)}` : ''}</b></div>` +
+    (st.segCount > 1
+      ? `<div class="drow info"><span>分段</span><b>完成 ${st.segDone} / ${st.segCount} 段` +
+        `${Number.isFinite(st.activeRatio) ? `　目前段收到 ${st.activeRatio.toFixed(2)} × K` : ''}</b></div>`
+      : '') +
+    `<div class="drow info"><span>封包</span><b>好 ${st.packetsGood} / 壞 ${st.packetsBad}` +
+    `（遺失 ${((st.packetsBad / Math.max(1, st.packetsGood + st.packetsBad)) * 100).toFixed(1)}%）</b></div>` +
+    `<div class="drow info"><span>通道</span><b>SNR ${st.snrDb?.toFixed(1) ?? '--'} dB，` +
+    `時脈 ${st.rhoPpm?.toFixed(0) ?? '--'} ppm</b></div>`;
+}
+
+async function finishReceive() {
+  const rx = state.rx;
+  await stopReceive();
+  const secs = (performance.now() - state.t0) / 1000;
+  let r = rx.result;
+  log('');
+  log(`✓ 音訊接收完成（${fmtBytes(r.bytes.length)}），SHA-256 ${r.hashOk ? '相符' : '不符'}`);
+
+  if (isEncrypted(r.bytes)) {
+    const pw = currentPw();
+    if (!pw) { log('✗ 內容是加密的，請輸入密碼後重新接收。'); return; }
+    try {
+      const dec = await decryptFile(pw, r.bytes);
+      r = { name: dec.name, bytes: dec.bytes, hashOk: r.hashOk };
+      log(`✓ 解密成功：${dec.name}`);
+    } catch (e) {
+      log(`✗ ${e.message}`);
+      log('  （AES-GCM 的驗證標籤不符。密碼對的話一定解得開，所以這代表密碼錯了。）');
+      $('bar').classList.add('bad');
+      return;
+    }
+  }
+  log(`  ${r.name}（${fmtBytes(r.bytes.length)}）`);
+  log(`  耗時 ${fmtSec(secs)}，實測 ${(r.bytes.length / secs).toFixed(0)} B/s`);
+  log(`  SHA-256 ${r.hashOk ? '✓ 相符' : '✗ 不符 —— 資料有誤'}`);
+  log(`  ${rx.file.segCount} 段全部完成，封包 好 ${rx.packetsGood} / 壞 ${rx.packetsBad}`);
+
+  const blob = new Blob([r.bytes], { type: 'application/octet-stream' });
+  const a = $('dlFile');
+  if (a.href.startsWith('blob:')) URL.revokeObjectURL(a.href);
+  a.href = URL.createObjectURL(blob);
+  a.download = r.name;
+  a.textContent = `下載 ${r.name}`;
+  a.hidden = false;
+  $('bar').style.width = '100%';
+  $('bar').classList.toggle('bad', !r.hashOk);
+}
+
+async function stopReceive() {
+  clearInterval(state.timer);
+  state.timer = null;
+  state.rx = null;
+  if (state.node && state.worklet) state.node.port.postMessage('stop');
+  if (state.stream) state.stream.getTracks().forEach((t) => t.stop());
+  if (state.ctx) { await state.ctx.close(); state.ctx = null; }
+  state.node = null;
+  $('recvStart').disabled = false;
+  $('recvStop').disabled = true;
+}
+
+// ---------------------------------------------------------------- 綁定
+
+function setRole(role) {
+  $('sendPanel').hidden = role !== 'send';
+  $('recvPanel').hidden = role !== 'recv';
+}
+
+$('picker').onchange = async (e) => {
+  const f = e.target.files[0];
+  if (!f) return;
+  state.file = { name: f.name, bytes: new Uint8Array(await f.arrayBuffer()) };
+  showEstimate();
+  log(`已選擇 ${f.name}（${fmtBytes(state.file.bytes.length)}）`);
+};
+$('sendStart').onclick = () => startSend().catch((e) => log('✗ ' + e.message));
+$('sendStop').onclick = () => stopSend().catch((e) => log('✗ ' + e.message));
+$('recvStart').onclick = () => startReceive().catch((e) => log('✗ ' + e.message));
+$('recvStop').onclick = () => stopReceive().catch((e) => log('✗ ' + e.message));
+$('clearLog').onclick = () => { $('log').textContent = ''; };
+document.querySelectorAll('input[name=role]').forEach((el) => { el.onchange = () => setRole(el.value); });
+document.querySelectorAll('input[name=band], input[name=mod]').forEach((el) => { el.onchange = describeBand; });
+
+window.__wavesync = { SendSession, ReceiveSession, sessionLayout, SR, encryptFile, decryptFile, isEncrypted };
+
+setRole(document.querySelector('input[name=role]:checked').value);
+diagnose();
+describeBand();
+log('wavesync — 超音波檔案傳輸');
+log(`來源：${location.href}`);
+log('');
+})();
+</script>
+
+</body>
+</html>

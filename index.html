@@ -102,7 +102,7 @@ h1 #ver { font-size: 13px; font-weight: 400; color: var(--muted); margin-left: 6
 
 </head>
 <body>
-<h1>wavesync <span id="ver">V26.0805 23:35</span></h1>
+<h1>wavesync <span id="ver">V26.0805 23:47</span></h1>
 <p class="sub">用聲音把檔案從一台裝置送到另一台。無網路、無配對、無伺服器。</p>
 
 <section class="card">
@@ -2064,6 +2064,7 @@ class SendSession {
 
     this.segIndex = 0;
     this.acked = new Set();          // 由 ACK 標記已完成的段（目前尚無 ACK 通道）
+    this.segCounters = new Map();    // 每段的 seed 進度，換段回來要接續
     this.covered = new Set();        // 這一輪已經送過的段
     this.roundComplete = false;
     this.rounds = 1;
@@ -2082,10 +2083,17 @@ class SendSession {
   }
 
   _openSegment(i) {
+    // 保存目前這一段的 seed 計數，換回來時要接續。
+    //
+    // 不接續的話會出大事：Encoder 每次重建都從 seed 0 開始，而接收端靠
+    // seed 去重 —— 第二輪送的封包會被整批當成重複丟掉，等於毫無貢獻。
+    // 症狀是「第一輪沒收齊就永遠收不齊」，但畫面上一切看起來都正常。
+    if (this.encoder) this.segCounters.set(this.segIndex, this.encoder.counter);
     this.segIndex = i;
     this.segOffset = i * this.perSeg;
     const end = Math.min(this.segOffset + this.perSeg, this.bytes.length);
     this.encoder = new Encoder(this.bytes.subarray(this.segOffset, end), this.layout.payloadSize);
+    this.encoder.counter = this.segCounters.get(i) ?? 0;
     this.packetsInSeg = 0;
     this.manifest = encodeManifest({
       blockSize: this.layout.payloadSize,

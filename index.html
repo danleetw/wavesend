@@ -102,7 +102,7 @@ h1 #ver { font-size: 13px; font-weight: 400; color: var(--muted); margin-left: 6
 
 </head>
 <body>
-<h1>wavesync <span id="ver">V26.0806 00:06</span></h1>
+<h1>wavesync <span id="ver">V26.0806 00:11</span></h1>
 <p class="sub">用聲音把檔案從一台裝置送到另一台。無網路、無配對、無伺服器。</p>
 
 <section class="card">
@@ -2876,9 +2876,11 @@ async function startSend() {
     state.txMic = micStream;
     const rec = await makeRecorder(ctx, (chunk) => {
       state.ackBuf.push(chunk);
-      // 只留最近約 6 秒，夠涵蓋一個訊框加聽窗
+      // 只留最近約 2 秒。留 6 秒的話每次搜尋都要對 288000 個 sample 做
+      // 512K 點的 FFT，在主執行緒上耗掉上百毫秒，會害音訊排程來不及、
+      // 訊框出現破音 —— 實測封包遺失衝到 46%，而 SNR 看起來卻還好。
       let total = state.ackBuf.reduce((a, c) => a + c.length, 0);
-      while (total > SR * 6 && state.ackBuf.length > 1) total -= state.ackBuf.shift().length;
+      while (total > SR * 2 && state.ackBuf.length > 1) total -= state.ackBuf.shift().length;
     });
     const mute0 = ctx.createGain();
     mute0.gain.value = 0;
@@ -2935,8 +2937,12 @@ async function startSend() {
 // 所以不會把自己的輸出誤認成回報。
 function checkForAck(tx) {
   if (!state.txRec || !state.ackBuf.length) return;
+  // 一個週期只搜一次就好；搜尋本身不便宜，跟音訊排程搶同一個執行緒
+  const now = performance.now();
+  if (state.lastAckScan && now - state.lastAckScan < 2500) return;
+  state.lastAckScan = now;
   const total = state.ackBuf.reduce((a, c) => a + c.length, 0);
-  if (total < SR * 2) return;
+  if (total < SR * 1.2) return;
   const buf = new Float32Array(total);
   let o = 0;
   for (const c of state.ackBuf) { buf.set(c, o); o += c.length; }
@@ -3180,13 +3186,22 @@ function sendAckIfDue(ctx, rx) {
   state.ackedFrameEnd = rx.lastFrameEnd;
 
   const tCapture = state.recordedAt - (state.recorded - rx.lastFrameEnd) / SR;
-  const windowStart = tCapture - state.inLatency;
   const beaconSec = ackFrameSamples(currentBand()) / SR;
-  const when = windowStart + (ACK_WINDOW_SEC - beaconSec) / 2 - state.outLatency;
-  const lead = when - ctx.currentTime;
+  const cycle = rx.frameSamples / SR + ACK_WINDOW_SEC;
+
+  // 瞄準「下一個」聽窗，不是剛過去的那個。
+  //
+  // 接收端要等訊框收完、等計時器、再解調（自動偵測時兩種調變各解一次，
+  // 實機約 400 ms）才知道訊框結束在哪 —— 那時當下的聽窗早就過了。
+  // 實測 lead 是 −381 ms，一次都送不出去。訊框是週期性的，
+  // 往後推整數個週期就能落在未來的窗裡，餘裕從負值變成三秒多。
+  let when = (tCapture - state.inLatency) + (ACK_WINDOW_SEC - beaconSec) / 2 - state.outLatency;
+  let lead = when - ctx.currentTime;
+  let hops = 0;
+  while (lead < 0.15 && hops < 4) { when += cycle; lead += cycle; hops++; }
   state.lastAckLead = lead;
-  // 已經來不及就跳過這一次 —— 硬送會落在對方的資料訊框上，反而干擾
-  if (lead < 0.01) return;
+  state.lastAckHops = hops;
+  if (lead < 0.15) return;
 
   const needed = rx.neededSegments();
   const payload = encodeAck({ hash8: rx.file.hash8, done: rx.done, needed });
@@ -3255,7 +3270,7 @@ function renderProgress() {
     `時脈 ${st.rhoPpm?.toFixed(0) ?? '--'} ppm　調變 ${st.detectedMod ?? '偵測中'}</b></div>` +
     `<div class="drow info"><span>回報</span><b>已送 ${state.acksSent ?? 0} 次` +
     `${state.lastAckLead !== null ? `　提前量 ${(state.lastAckLead * 1000).toFixed(0)} ms` : ''}` +
-    `${state.lastAckLead !== null && state.lastAckLead < 0.01 ? '（來不及，已跳過）' : ''}</b></div>` +
+    `${state.lastAckHops ? `（往後推 ${state.lastAckHops} 個週期）` : ''}</b></div>` +
     (st.snrDb !== null && st.snrDb < 11 && st.detectedMod === 'qpsk'
       ? `<div class="drow warn"><span>建議</span><b>SNR 偏低，發送端改用 BPSK 會更快</b></div>` : '');
 }

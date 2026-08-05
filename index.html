@@ -86,11 +86,17 @@ input[type=password] {
   width: 100%; padding: 9px 12px; border-radius: 8px; font: inherit; font-size: 15px;
   border: 1px solid var(--line); background: var(--bg); color: var(--fg);
 }
+
+canvas.spec { width: 100%; height: 150px; display: block; margin-top: 12px;
+  border: 1px solid var(--line); border-radius: 8px; background: var(--bg); }
+
+h1 #ver { font-size: 13px; font-weight: 400; color: var(--muted); margin-left: 6px;
+  font-family: ui-monospace, Consolas, monospace; letter-spacing: 0; }
 </style>
 
 </head>
 <body>
-<h1>wavesync</h1>
+<h1>wavesync <span id="ver">V26.0805 22:17</span></h1>
 <p class="sub">用聲音把檔案從一台裝置送到另一台。無網路、無配對、無伺服器。</p>
 
 <section class="card">
@@ -151,7 +157,6 @@ input[type=password] {
     <button id="sendStart">開始傳送</button>
     <button id="sendStop" disabled>停止</button>
   </div>
-  <div id="txProgress" class="diag" style="margin-top:10px"></div>
   <p class="hint">噴泉碼沒有「送完」的概念 —— 它會一直產生新封包，直到你按停止。接收端湊夠就會自己完成。</p>
 </section>
 
@@ -161,6 +166,8 @@ input[type=password] {
     <button id="recvStart">開始接收</button>
     <button id="recvStop" disabled>停止</button>
   </div>
+  <canvas id="rxSpec" class="spec"></canvas>
+  <p class="hint" id="rxLevel"></p>
   <div class="progress"><i id="bar"></i></div>
   <div id="rxProgress" class="diag"></div>
   <div class="btns"><a id="dlFile" class="btn" hidden download></a></div>
@@ -1855,14 +1862,6 @@ const CRYPTO_OVERHEAD = HEADER + 16;
 //
 // 調變可選 QPSK 或 BPSK（見 MODULATION）。不做自適應 bit-loading 是因為
 // 那需要接收端把通道回報給發送端，而目前是單向廣播。
-
-
-
-
-
-
-
-
 const TARGET_FRAME_SEC = 3;
 const MANIFEST_EVERY = 16;        // 每這麼多個封包插一個 manifest
 // QPSK（2 bit）或 BPSK（1 bit）。BPSK 速率減半，但門檻低 4.8 dB ——
@@ -2014,6 +2013,11 @@ class ReceiveSession {
     this.bytesRecovered = 0;
     this.lastSnrDb = null;
     this.lastRhoPpm = null;
+    // 解不開時最先要看的診斷：chirp 到底有沒有被抓到。
+    // framesSeen 只在同步成功時才增加，所以它為 0 就代表前導從未被找到 ——
+    // 那是「訊號沒進來 / 頻帶選錯 / 位準太低」，而不是解調參數的問題。
+    this.bestSyncRatio = 0;
+    this.syncAttempts = 0;
     this.result = null;
     this.hashOk = null;
   }
@@ -2072,6 +2076,8 @@ class ReceiveSession {
 
     const window = this.buf.subarray(from, this.len);
     const sync = findPreamble(window, this.chirp, 0, Math.min(window.length, this.frameSamples));
+    this.syncAttempts++;
+    if (sync.ratio > this.bestSyncRatio) this.bestSyncRatio = sync.ratio;
     if (sync.index < 0 || sync.ratio < 8) {
       // 這段沒有前導，跳過大半再找（保留重疊，避免切在前導中間）
       this.searchFrom += Math.max(1, this.frameSamples - PREAMBLE_LEN * 2);
@@ -2172,6 +2178,8 @@ class ReceiveSession {
       packetsBad: this.packetsBad,
       framesDecoded: this.framesDecoded,
       framesSeen: this.framesSeen,
+      syncAttempts: this.syncAttempts,
+      bestSyncRatio: this.bestSyncRatio,
       snrDb: this.lastSnrDb,
       rhoPpm: this.lastRhoPpm,
       activeRatio: seg.find((s) => s.decoder)?.decoder?.received / (seg.find((s) => s.decoder)?.decoder?.k || 1),
@@ -2225,6 +2233,146 @@ class RecorderProcessor extends AudioWorkletProcessor {
 
 registerProcessor('recorder', RecorderProcessor);
 `;
+
+// ═══ spectrum.js ═══════════════════════════════════════════════
+// 即時頻譜顯示。
+//
+// 解不開的時候，光看紀錄文字判斷不出是「訊號沒進來」「位準太低」還是
+// 「頻帶選錯」。頻譜一眼就能分辨 —— 而且發送端也要有，才能確認
+// 播出去的東西真的落在該落的頻率上。
+//
+// 用 Web Audio 的 AnalyserNode 而不是自己做 FFT：它在音訊執行緒算，
+// 不占主執行緒（主執行緒已經在跑解調了）。
+
+const FFT_SIZE = 4096;
+const DB_MIN = -110;
+const DB_MAX = -10;
+const PEAK_DECAY = 0.35;   // dB / frame
+
+class Spectrum {
+  /**
+   * @param {HTMLCanvasElement} canvas
+   * @param {{fLow:number, fHigh:number}} band 要標示的作用頻帶
+   */
+  constructor(canvas, band) {
+    this.canvas = canvas;
+    this.band = band;
+    this.analyser = null;
+    this.raf = null;
+    this.peak = null;
+    this.onLevel = null;      // (inBandDb, outBandDb) => void
+  }
+
+  attach(ctx, node) {
+    this.analyser = ctx.createAnalyser();
+    this.analyser.fftSize = FFT_SIZE;
+    this.analyser.smoothingTimeConstant = 0.5;
+    this.sampleRate = ctx.sampleRate;
+    node.connect(this.analyser);
+    this.data = new Float32Array(this.analyser.frequencyBinCount);
+    this.peak = new Float32Array(this.analyser.frequencyBinCount).fill(DB_MIN);
+    this._loop();
+    return this.analyser;
+  }
+
+  detach() {
+    if (this.raf) cancelAnimationFrame(this.raf);
+    this.raf = null;
+    try { this.analyser?.disconnect(); } catch { /* ctx 可能已關閉 */ }
+    this.analyser = null;
+  }
+
+  setBand(band) { this.band = band; }
+
+  _loop() {
+    this.raf = requestAnimationFrame(() => this._loop());
+    if (!this.analyser) return;
+    this.analyser.getFloatFrequencyData(this.data);
+    for (let i = 0; i < this.peak.length; i++) {
+      this.peak[i] = Math.max(this.data[i], this.peak[i] - PEAK_DECAY);
+    }
+    this._report();
+    this._draw();
+  }
+
+  // 頻帶內 vs 頻帶外的平均位準 —— 直接告訴使用者訊號有沒有進來、比噪音高多少
+  _report() {
+    if (!this.onLevel) return;
+    const nyq = this.sampleRate / 2;
+    const bin = (hz) => Math.round((hz / nyq) * this.data.length);
+    const mean = (a, b) => {
+      let s = 0, c = 0;
+      for (let i = Math.max(0, bin(a)); i < Math.min(this.data.length, bin(b)); i++) {
+        s += Math.pow(10, this.data[i] / 10); c++;
+      }
+      return c ? 10 * Math.log10(s / c) : DB_MIN;
+    };
+    const inB = mean(this.band.fLow, this.band.fHigh);
+    // 頻帶外取一段沒有訊號、也不太受環境低頻噪音影響的區間當底噪參考
+    const ref = this.band.fLow > 10000 ? mean(8000, this.band.fLow - 1000) : mean(22500, 23800);
+    this.onLevel(inB, ref);
+  }
+
+  _draw() {
+    const cv = this.canvas;
+    const dpr = window.devicePixelRatio || 1;
+    if (cv.clientWidth === 0) return;
+    const W = (cv.width = cv.clientWidth * dpr);
+    const H = (cv.height = 150 * dpr);
+    const g = cv.getContext('2d');
+    const css = getComputedStyle(document.documentElement);
+    const fg = css.getPropertyValue('--fg').trim();
+    const accent = css.getPropertyValue('--accent').trim();
+    const line = css.getPropertyValue('--line').trim();
+
+    g.clearRect(0, 0, W, H);
+    const nyq = this.sampleRate / 2;
+    const x = (hz) => (hz / nyq) * W;
+    const y = (db) => H - ((Math.max(DB_MIN, Math.min(DB_MAX, db)) - DB_MIN) / (DB_MAX - DB_MIN)) * H;
+
+    // 作用頻帶
+    g.fillStyle = accent;
+    g.globalAlpha = 0.12;
+    g.fillRect(x(this.band.fLow), 0, x(this.band.fHigh) - x(this.band.fLow), H);
+    g.globalAlpha = 1;
+
+    // 格線與刻度
+    g.strokeStyle = line;
+    g.fillStyle = fg;
+    g.lineWidth = dpr;
+    g.font = `${10 * dpr}px system-ui, sans-serif`;
+    g.textAlign = 'center';
+    g.textBaseline = 'bottom';
+    for (let hz = 4000; hz < nyq; hz += 4000) {
+      g.globalAlpha = 0.25;
+      g.beginPath(); g.moveTo(x(hz), 0); g.lineTo(x(hz), H); g.stroke();
+      g.globalAlpha = 0.6;
+      g.fillText(`${hz / 1000}k`, x(hz), H - 2 * dpr);
+    }
+    g.globalAlpha = 1;
+
+    // peak hold
+    g.strokeStyle = fg;
+    g.globalAlpha = 0.35;
+    g.beginPath();
+    for (let i = 0; i < this.peak.length; i++) {
+      const px = (i / this.peak.length) * W, py = y(this.peak[i]);
+      i ? g.lineTo(px, py) : g.moveTo(px, py);
+    }
+    g.stroke();
+    g.globalAlpha = 1;
+
+    // 目前頻譜
+    g.strokeStyle = accent;
+    g.lineWidth = 1.5 * dpr;
+    g.beginPath();
+    for (let i = 0; i < this.data.length; i++) {
+      const px = (i / this.data.length) * W, py = y(this.data[i]);
+      i ? g.lineTo(px, py) : g.moveTo(px, py);
+    }
+    g.stroke();
+  }
+}
 
 // ═══ app.js ════════════════════════════════════════════════════
 // Step 2b：實際的檔案傳輸介面。
@@ -2313,6 +2461,14 @@ async function startSend() {
   gain.connect(ctx.destination);
   state.gain = gain;
 
+  state.txSpec = new Spectrum($('txSpec'), BANDS[currentBand()]);
+  state.txSpec.onLevel = (inB, ref) => {
+    $('txLevel').textContent =
+      `頻帶內 ${inB.toFixed(0)} dB　帶外參考 ${ref.toFixed(0)} dB　` +
+      `（頻帶內應明顯高於帶外；帶外若也抬高就是失真灑出來了）`;
+  };
+  state.txSpec.attach(ctx, gain);
+
   let nextTime = ctx.currentTime + 0.15;
   const pump = () => {
     if (!state.tx) return;
@@ -2355,6 +2511,7 @@ function renderTx(tx) {
 }
 
 async function stopSend() {
+  state.txSpec?.detach(); state.txSpec = null;
   clearInterval(state.timer);
   state.timer = null;
   state.tx = null;
@@ -2443,7 +2600,20 @@ async function startReceive() {
   const rec = await makeRecorder(ctx, (chunk) => queue.push(chunk));
   const mute = ctx.createGain();
   mute.gain.value = 0;
-  ctx.createMediaStreamSource(stream).connect(rec.node).connect(mute).connect(ctx.destination);
+  const src = ctx.createMediaStreamSource(stream);
+  src.connect(rec.node).connect(mute).connect(ctx.destination);
+
+  state.rxSpec = new Spectrum($('rxSpec'), BANDS[currentBand()]);
+  state.rxSpec.onLevel = (inB, ref) => {
+    const snr = inB - ref;
+    const verdict = inB < -95 ? '訊號沒進來 —— 確認發送端在播、頻帶兩端一致'
+      : snr < 6 ? '訊號太弱 —— 靠更近、加大音量'
+      : snr < 12 ? '勉強，可改用 BPSK'
+      : '位準足夠';
+    $('rxLevel').textContent = `頻帶內 ${inB.toFixed(0)} dB　底噪 ${ref.toFixed(0)} dB　` +
+      `差 ${snr.toFixed(0)} dB　→ ${verdict}`;
+  };
+  state.rxSpec.attach(ctx, src);
   state.node = rec.node;
   state.worklet = rec.worklet;
 
@@ -2469,9 +2639,19 @@ function renderProgress() {
   const secs = (performance.now() - state.t0) / 1000;
   const el = $('rxProgress');
 
+  // chirp 有沒有被抓到，是解不開時第一個要看的東西 —— 所以永遠顯示
+  const syncRow =
+    `<div class="drow ${st.framesSeen ? 'ok' : 'bad'}"><span>同步</span><b>` +
+    (st.framesSeen
+      ? `已鎖定 ${st.framesSeen} 個訊框，解出 ${st.framesDecoded}`
+      : `尚未鎖定（試了 ${st.syncAttempts} 次，最佳相關 ${st.bestSyncRatio.toFixed(1)}，需 ≥ 8）`) +
+    `</b></div>`;
+
   if (!st.name) {
-    el.innerHTML = `<div class="drow info"><span>狀態</span><b>等待檔案資訊…` +
-      `（已聽 ${fmtSec(secs)}，解出 ${st.framesDecoded}/${st.framesSeen} 訊框）</b></div>`;
+    el.innerHTML = syncRow +
+      `<div class="drow info"><span>狀態</span><b>` +
+      (st.framesSeen ? '已鎖定但還沒收到檔案資訊…' : '找不到前導訊號') +
+      `（已聽 ${fmtSec(secs)}）</b></div>`;
     return;
   }
 
@@ -2481,7 +2661,7 @@ function renderProgress() {
   const eta = rate > 0 && remain > 0 ? remain / rate : null;
   $('bar').style.width = `${Math.min(100, pct)}%`;
 
-  el.innerHTML =
+  el.innerHTML = syncRow +
     `<div class="drow info"><span>檔案</span><b>${st.name}（${fmtBytes(st.fileSize)}）</b></div>` +
     `<div class="drow info"><span>已還原</span><b>${fmtBytes(st.bytesRecovered)} / ${fmtBytes(st.fileSize)}　` +
     `${pct.toFixed(1)}%</b></div>` +
@@ -2536,6 +2716,7 @@ async function finishReceive() {
 }
 
 async function stopReceive() {
+  state.rxSpec?.detach(); state.rxSpec = null;
   clearInterval(state.timer);
   state.timer = null;
   state.rx = null;
@@ -2567,7 +2748,13 @@ $('recvStart').onclick = () => startReceive().catch((e) => log('✗ ' + e.messag
 $('recvStop').onclick = () => stopReceive().catch((e) => log('✗ ' + e.message));
 $('clearLog').onclick = () => { $('log').textContent = ''; };
 document.querySelectorAll('input[name=role]').forEach((el) => { el.onchange = () => setRole(el.value); });
-document.querySelectorAll('input[name=band], input[name=mod]').forEach((el) => { el.onchange = describeBand; });
+document.querySelectorAll('input[name=band], input[name=mod]').forEach((el) => {
+  el.onchange = () => {
+    describeBand();
+    state.txSpec?.setBand(BANDS[currentBand()]);
+    state.rxSpec?.setBand(BANDS[currentBand()]);
+  };
+});
 
 window.__wavesync = { SendSession, ReceiveSession, sessionLayout, SR, encryptFile, decryptFile, isEncrypted };
 

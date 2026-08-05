@@ -96,7 +96,7 @@ h1 #ver { font-size: 13px; font-weight: 400; color: var(--muted); margin-left: 6
 
 </head>
 <body>
-<h1>wavesync <span id="ver">V26.0805 22:31</span></h1>
+<h1>wavesync <span id="ver">V26.0805 22:39</span></h1>
 <p class="sub">用聲音把檔案從一台裝置送到另一台。無網路、無配對、無伺服器。</p>
 
 <section class="card">
@@ -2429,6 +2429,8 @@ function showEstimate() {
 
 async function startSend() {
   if (!state.file) { log('✗ 請先選檔案。'); return; }
+  $('txProgress').innerHTML = '';
+  $('txLevel').textContent = '';
   const pw = currentPw();
   if (!pw) { log('✗ 請先輸入密碼。接收端必須輸入相同的密碼才解得開。'); return; }
 
@@ -2576,7 +2578,26 @@ function micError(e) {
   }
 }
 
+// 開始新的接收之前把上一次的痕跡清乾淨。
+// 舊的下載連結留在畫面上最危險 —— 它指向的是上一個檔案，
+// 使用者很容易在新傳輸還沒完成時誤點成舊的那份。
+function resetReceiveUi() {
+  const a = $('dlFile');
+  if (a.href.startsWith('blob:')) URL.revokeObjectURL(a.href);
+  a.removeAttribute('href');
+  a.textContent = '';
+  a.hidden = true;
+
+  const bar = $('bar');
+  bar.style.width = '0%';
+  bar.classList.remove('bad');
+
+  $('rxProgress').innerHTML = '';
+  $('rxLevel').textContent = '';
+}
+
 async function startReceive() {
+  resetReceiveUi();
   let stream;
   try {
     stream = await navigator.mediaDevices.getUserMedia({

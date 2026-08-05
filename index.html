@@ -102,7 +102,7 @@ h1 #ver { font-size: 13px; font-weight: 400; color: var(--muted); margin-left: 6
 
 </head>
 <body>
-<h1>wavesync <span id="ver">V26.0805 23:15</span></h1>
+<h1>wavesync <span id="ver">V26.0805 23:35</span></h1>
 <p class="sub">用聲音把檔案從一台裝置送到另一台。無網路、無配對、無伺服器。</p>
 
 <section class="card">
@@ -168,7 +168,13 @@ h1 #ver { font-size: 13px; font-weight: 400; color: var(--muted); margin-left: 6
   <canvas id="txSpec" class="spec"></canvas>
   <p class="hint" id="txLevel"></p>
   <div id="txProgress" class="diag" style="margin-top:10px"></div>
-  <p class="hint">噴泉碼沒有「送完」的概念 —— 它會一直產生新封包，直到你按停止。接收端湊夠就會自己完成。</p>
+  <p class="hint">噴泉碼沒有「送完」的概念 —— 它會一直產生新封包。
+  發送端每個訊框後會留 0.8 秒的<b>聽窗</b>，等接收端回報還缺哪些段；
+  收到「已收齊」的回報才自動停止。所以發送端也需要麥克風權限。</p>
+  <p class="hint"><b>若「回報」一直是 0</b>：兩台裝置只隔 2–3 cm、不能同時收發，
+  回報必須落在那 0.8 秒的空檔裡。接收端會依兩端的音訊延遲推算送出時機，
+  若估計偏掉就永遠對不上 —— 這時看接收端顯示的「提前量」，
+  正常應該落在 200–600 ms；接近 0 或負值代表來不及，訊框長度或延遲估計有問題。</p>
 </section>
 
 <section class="card" id="recvPanel" hidden>
@@ -787,7 +793,7 @@ const TARGET_PEAK = 0.9;
  * @param {object} plan  makePlan() 的輸出
  * @returns {{samples: Float32Array, symbols: number, capacityBytes: number}}
  */
-function modulate(payload, plan) {
+function modulate(payload, plan, opts = {}) {
   const fft = makeFFT();
   const bitsPerSym = plan.bitsPerSymbol;
   if (bitsPerSym <= 0) throw new Error('plan 沒有任何可用副載波');
@@ -828,7 +834,8 @@ function modulate(payload, plan) {
   for (const sym of ofdm) for (const v of sym) { const a = Math.abs(v); if (a > peak) peak = a; }
   const gain = peak > 0 ? TARGET_PEAK / peak : 0;
 
-  const chirp = makeChirp(plan.spec.fLow, plan.spec.fHigh);
+  // ACK 走反向掃頻，兩者的匹配濾波幾乎不互相響應，不會彼此誤認
+  const chirp = opts.chirp ?? makeChirp(plan.spec.fLow, plan.spec.fHigh);
   // 尾端多留 SYM_WINDOW 讓最後一個符元的漸變收乾淨
   const total = PREAMBLE_LEN + ofdm.length * SYM + SYM_WINDOW;
   const out = new Float32Array(total);
@@ -1098,7 +1105,7 @@ function demodulate(samples, plan, opts) {
   if (!symbols) throw new Error('需要 opts.symbols');
 
   const fft = makeFFT();
-  const chirp = makeChirp(plan.spec.fLow, plan.spec.fHigh);
+  const chirp = opts.chirp ?? makeChirp(plan.spec.fLow, plan.spec.fHigh);
   const sync = findPreamble(samples, chirp);
   if (sync.index < 0 || sync.ratio < MIN_SYNC_RATIO) {
     return { ok: false, reason: `同步失敗（ratio ${sync.ratio.toFixed(1)} < ${MIN_SYNC_RATIO}）`, sync };
@@ -1757,6 +1764,113 @@ function fitName(name, payloadSize) {
   return base + ext;
 }
 
+// ═══ ../src/transfer/ack.js ════════════════════════════════════
+// 反向鏈路的回報（ACK）。
+//
+// 兩台裝置距離只有 2–3 cm，不可能同時收發 —— 自己喇叭的輸出會直接蓋掉
+// 自己的麥克風。所以走半雙工：發送端每隔幾個訊框留一個「聽窗」，
+// 接收端在那個窗裡送回報。
+//
+// 回報訊號用「反向 chirp」（22→18 kHz）而不是資料訊框的正向 chirp：
+// 兩者的匹配濾波幾乎不互相響應，發送端不會把自己的回音誤認成 ACK，
+// 接收端也不會把發送端的訊框誤認成回報。
+//
+//   [ 反向 chirp | guard | probe ×5 | 資料符元 ×4 ]  ≈ 312 ms
+//
+// 內容刻意做小：只要讓發送端知道「哪些段還缺」就夠了。
+
+
+
+
+
+
+const ACK_SYMBOLS = 4;
+const ACK_BITS = 1;                    // BPSK：回報必須比資料更禁得起雜訊
+const BITMAP_SEGMENTS = 128;           // 從 firstNeeded 起算，涵蓋這麼多段
+const BITMAP_BYTES = BITMAP_SEGMENTS / 8;
+
+//   [ magic:2 "AK" | hash8:8 | flags:1 | firstNeeded:3 | bitmap:16 | crc:2 ] = 32 bytes
+const ACK_MAGIC = 0x414b;
+const ACK_PAYLOAD_BYTES = 2 + 8 + 1 + 3 + BITMAP_BYTES + 2;
+
+function ackPlan(band) {
+  return makePlan({ band, fallbackBits: ACK_BITS });
+}
+
+function ackFrameSamples(band) {
+  return PREAMBLE_LEN + (PROBE_SYMS + ACK_SYMBOLS) * SYM;
+}
+
+// 反向掃頻：makeChirp 的斜率由參數順序決定，把高低頻對調即得
+const reverseChirp = (plan) => makeChirp(plan.spec.fHigh, plan.spec.fLow);
+
+/**
+ * @param {{hash8:Uint8Array, done:boolean, needed:number[]}} s
+ *        needed 為「還缺的段號」清單
+ */
+function encodeAck({ hash8, done, needed }) {
+  const out = new Uint8Array(ACK_PAYLOAD_BYTES);
+  out[0] = (ACK_MAGIC >> 8) & 0xff; out[1] = ACK_MAGIC & 0xff;
+  out.set(hash8.subarray(0, 8), 2);
+  out[10] = done ? 1 : 0;
+  const first = needed.length ? Math.min(...needed) : 0;
+  out[11] = (first >> 16) & 0xff; out[12] = (first >> 8) & 0xff; out[13] = first & 0xff;
+  for (const seg of needed) {
+    const rel = seg - first;
+    if (rel >= 0 && rel < BITMAP_SEGMENTS) out[14 + (rel >> 3)] |= 1 << (rel & 7);
+  }
+  const c = crc16(out, 0, ACK_PAYLOAD_BYTES - 2);
+  out[ACK_PAYLOAD_BYTES - 2] = (c >> 8) & 0xff;
+  out[ACK_PAYLOAD_BYTES - 1] = c & 0xff;
+  return out;
+}
+
+function decodeAck(buf) {
+  if (buf.length < ACK_PAYLOAD_BYTES) return null;
+  if (((buf[0] << 8) | buf[1]) !== ACK_MAGIC) return null;
+  const want = (buf[ACK_PAYLOAD_BYTES - 2] << 8) | buf[ACK_PAYLOAD_BYTES - 1];
+  if (crc16(buf, 0, ACK_PAYLOAD_BYTES - 2) !== want) return null;
+  const first = (buf[11] << 16) | (buf[12] << 8) | buf[13];
+  const needed = [];
+  for (let i = 0; i < BITMAP_SEGMENTS; i++) {
+    if (buf[14 + (i >> 3)] & (1 << (i & 7))) needed.push(first + i);
+  }
+  return { hash8: buf.slice(2, 10), done: buf[10] === 1, first, needed };
+}
+
+/** 產生一段回報音訊 */
+function modulateAck(band, payload) {
+  const plan = ackPlan(band);
+  const bytesPerFrame = Math.floor((ACK_SYMBOLS * plan.bitsPerSymbol) / 8);
+  const buf = new Uint8Array(bytesPerFrame);
+  buf.set(payload.subarray(0, Math.min(payload.length, bytesPerFrame)));
+  return modulate(buf, plan, { chirp: reverseChirp(plan) }).samples;
+}
+
+/**
+ * 在一段錄音裡找回報訊號。
+ * @returns {{ack:object, index:number, ratio:number}|null}
+ */
+function findAck(samples, band, minRatio = 8) {
+  const plan = ackPlan(band);
+  const chirp = reverseChirp(plan);
+  const sync = findPreamble(samples, chirp);
+  if (sync.index < 0 || sync.ratio < minRatio) return null;
+
+  const need = ackFrameSamples(band);
+  if (samples.length - sync.index < need) return null;
+
+  let r;
+  try {
+    r = demodulate(samples.subarray(sync.index, sync.index + need), plan,
+      { symbols: ACK_SYMBOLS, chirp });
+  } catch { return null; }
+  if (!r.ok) return null;
+
+  const ack = decodeAck(r.bytes);
+  return ack ? { ack, index: sync.index, ratio: sync.ratio } : null;
+}
+
 // ═══ ../src/transfer/crypto.js ═════════════════════════════════
 // 以密碼加密傳輸內容。
 //
@@ -1889,6 +2003,17 @@ const CRYPTO_OVERHEAD = HEADER + 16;
 // 也就不可能自動偵測。固定成 120 可被兩種調變的封包符元數整除
 // （QPSK 24×5、BPSK 12×10；turbo 是 120×1 與 60×2），沒有浪費。
 const FRAME_DATA_SYMBOLS = 120;
+
+// 每個訊框之後留給對方回報的聽窗。
+//
+// 兩台裝置只隔 2–3 cm，不可能同時收發，所以必須排出空檔。窗開得比回報訊號
+// （312 ms）寬很多，是為了吸收時序誤差 —— 接收端要把「錄到的 sample 位置」
+// 換算成「輸出排程時間」，中間隔著兩端各自的音訊延遲，估計誤差可達數十毫秒。
+// 0.8 秒的窗給了 ±244 ms 的餘裕。
+//
+// 代價是 20% 的時間開銷，但 ACK 換回來的更多：可以跳過對方已收好的段
+// （續傳時常常過半），而且收齊就停，不必送完整整一輪。
+const ACK_WINDOW_SEC = 0.8;
 const MANIFEST_EVERY = 16;        // 每這麼多個封包插一個 manifest
 // QPSK（2 bit）或 BPSK（1 bit）。BPSK 速率減半，但門檻低 4.8 dB ——
 // 當喇叭的可聽互調逼得輸出必須調低時，這是唯一還能維持鏈路的辦法。
@@ -1942,6 +2067,10 @@ class SendSession {
     this.covered = new Set();        // 這一輪已經送過的段
     this.roundComplete = false;
     this.rounds = 1;
+    this.ackCount = 0;
+    this.lastAck = null;
+    this.remoteDone = false;
+    this.ackWindowSamples = Math.round(ACK_WINDOW_SEC * SR);
     this.packetsInSeg = 0;
     this.packetCount = 0;
     this.frameCount = 0;
@@ -1971,10 +2100,22 @@ class SendSession {
     });
   }
 
-  /** 標記某段已被接收端收妥（ACK 用） */
-  markAcked(i) {
-    this.acked.add(i);
-    if (i === this.segIndex) this._advance();
+  /**
+   * 套用收到的回報。
+   * @param {{hash8:Uint8Array, done:boolean, needed:number[]}} ack
+   * @returns {boolean} 是否為本次傳輸的回報（雜湊要對得上）
+   */
+  applyAck(ack) {
+    if (!ack.hash8.every((v, i) => v === this.hash[i])) return false;
+    this.ackCount++;
+    this.lastAck = ack;
+    if (ack.done) { this.remoteDone = true; return true; }
+    // needed 是「還缺的段」，其餘視為已收妥
+    const need = new Set(ack.needed);
+    for (let i = 0; i < this.segCount; i++) if (!need.has(i)) this.acked.add(i);
+    // 目前這一段對方已經有了就別再浪費時間
+    if (this.acked.has(this.segIndex)) this._advance();
+    return true;
   }
 
   _advance() {
@@ -1983,18 +2124,28 @@ class SendSession {
       const i = (this.segIndex + n) % this.segCount;
       if (!this.acked.has(i) && !this.covered.has(i)) { this._openSegment(i); return; }
     }
-    // 每一段都送過一輪了。接收端若還沒收齊，可以再跑一次 —— 已收好的段
-    // 會由續傳保留，不用重來。
+    // 每一段都送過一輪了。
+    //
+    // 這裡刻意「不」停止：實測過發送端跑完一輪就停、而接收端還沒收齊的情況。
+    // 沒有 ACK 時我們無從得知對方的進度，唯一安全的做法是繼續送下一輪；
+    // 收到 done 的回報才停。使用者當然仍可手動停。
     this.roundComplete = true;
+    this.nextRound();
   }
 
-  /** 再跑一輪（接收端沒收齊時用） */
+  /** 再跑一輪。已被 ACK 確認收妥的段會直接跳過。 */
   nextRound() {
     this.covered.clear();
     this.roundComplete = false;
-    this._openSegment(0);
     this.rounds++;
+    for (let i = 0; i < this.segCount; i++) {
+      if (!this.acked.has(i)) { this._openSegment(i); return; }
+    }
+    this.remoteDone = true;   // 全部都被確認了
   }
+
+  /** 是否該停止傳送 */
+  get finished() { return this.remoteDone; }
 
   get segmentProgress() { return this.packetsInSeg / (this.encoder.k * SEGMENT_BUDGET); }
 
@@ -2033,6 +2184,9 @@ class SendSession {
       covered: this.covered.size,
       roundComplete: this.roundComplete,
       rounds: this.rounds,
+      ackCount: this.ackCount,
+      ackedSegs: this.acked.size,
+      remoteDone: this.remoteDone,
     };
   }
 }
@@ -2077,6 +2231,8 @@ class ReceiveSession {
     // 那是「訊號沒進來 / 頻帶選錯 / 位準太低」，而不是解調參數的問題。
     this.bestSyncRatio = 0;
     this.syncAttempts = 0;
+    // 訊框結束的全域樣本位置 —— 回報要排在它之後的聽窗裡
+    this.lastFrameEnd = null;
     this.result = null;
     this.hashOk = null;
     // 續傳掛鉤：外部（UI 層）負責持久化。IndexedDB 是非同步的，
@@ -2128,9 +2284,14 @@ class ReceiveSession {
     return n;
   }
 
-  /** 已完成的段索引，供 ACK 回報用 */
-  ackList() {
-    return [...this.segments.entries()].filter(([, s]) => s.bytes).map(([i]) => i);
+  /** 還缺哪些段，供回報用 */
+  neededSegments() {
+    if (!this.file) return null;
+    const out = [];
+    for (let i = 0; i < this.file.segCount; i++) {
+      if (!this.segments.get(i)?.bytes) out.push(i);
+    }
+    return out;
   }
 
   /** 餵入新錄到的音訊 */
@@ -2144,7 +2305,9 @@ class ReceiveSession {
   _append(samples) {
     if (this.len + samples.length > this.buf.length) {
       // 先丟掉已經處理過的部分，不夠再擴充
-      const keepFrom = Math.max(0, this.searchFrom - this.base - PREAMBLE_LEN);
+      // searchFrom 會跳過訊框後的聽窗，可能指到「還沒收到」的位置，
+      // 所以要夾在已收到的範圍內，否則裁切後的長度會變成負的。
+      const keepFrom = Math.min(this.len, Math.max(0, this.searchFrom - this.base - PREAMBLE_LEN));
       if (keepFrom > 0) {
         this.buf.copyWithin(0, keepFrom, this.len);
         this.len -= keepFrom;
@@ -2180,7 +2343,9 @@ class ReceiveSession {
 
     this.framesSeen++;
     const frame = this.buf.subarray(start, start + this.frameSamples);
-    this.searchFrom = this.base + start + this.frameSamples - PREAMBLE_LEN;
+    this.lastFrameEnd = this.base + start + this.frameSamples;
+    // 訊框後面接的是聽窗（靜音），跳過它再找下一個前導
+    this.searchFrom = this.lastFrameEnd + Math.round(ACK_WINDOW_SEC * SR) - PREAMBLE_LEN;
 
     const picked = this._demodulate(frame);
     // 解不開也要把通道數值記下來：使用者在喬位置時，這是唯一的回饋來源。
@@ -2692,6 +2857,30 @@ async function startSend() {
   gain.connect(ctx.destination);
   state.gain = gain;
 
+  // 發送端也要開麥克風才能收回報。聽窗排在每個訊框之後（見 ACK_WINDOW_SEC）。
+  state.ackWindow = Math.round(ACK_WINDOW_SEC * SR);
+  state.ackFound = 0;
+  state.ackBuf = [];
+  try {
+    const micStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 1, sampleRate: SR },
+    });
+    state.txMic = micStream;
+    const rec = await makeRecorder(ctx, (chunk) => {
+      state.ackBuf.push(chunk);
+      // 只留最近約 6 秒，夠涵蓋一個訊框加聽窗
+      let total = state.ackBuf.reduce((a, c) => a + c.length, 0);
+      while (total > SR * 6 && state.ackBuf.length > 1) total -= state.ackBuf.shift().length;
+    });
+    const mute0 = ctx.createGain();
+    mute0.gain.value = 0;
+    ctx.createMediaStreamSource(micStream).connect(rec.node).connect(mute0).connect(ctx.destination);
+    state.txRec = rec;
+    log('已開啟麥克風接收回報（ACK）。');
+  } catch (e) {
+    log(`⚠ 無法開麥克風（${e.name}），將收不到回報 —— 傳送不會自動停止，請手動按停止。`);
+  }
+
   state.txSpec = new Spectrum($('txSpec'), BANDS[currentBand()]);
   state.txSpec.onLevel = (inB, ref) => {
     $('txLevel').textContent =
@@ -2705,13 +2894,13 @@ async function startSend() {
     if (!state.tx) return;
     // 排程到 currentTime + LOOKAHEAD 為止。噴泉碼是無限串流，
     // 只能邊播邊產生，不能先做一大塊。
-    if (tx.roundComplete && nextTime <= ctx.currentTime + 0.3) {
-      log(`✓ 已完整送過每一段（第 ${tx.stats().rounds} 輪），自動停止。`);
-      log('  接收端若還沒收齊，再按一次開始傳送即可 —— 它已收好的段會保留，不用重來。');
+    if (tx.finished) {
+      log(`✓ 接收端回報已收齊（共 ${tx.stats().ackCount} 次回報），自動停止。`);
       stopSend();
       return;
     }
-    while (!tx.roundComplete && nextTime < ctx.currentTime + LOOKAHEAD_SEC) {
+    checkForAck(tx);
+    while (nextTime < ctx.currentTime + LOOKAHEAD_SEC) {
       const samples = tx.nextFrame();
       if (state.txGain !== 1) for (let i = 0; i < samples.length; i++) samples[i] *= state.txGain;
       const buf = ctx.createBuffer(1, samples.length, SR);
@@ -2720,7 +2909,8 @@ async function startSend() {
       src.buffer = buf;
       src.connect(gain);
       src.start(nextTime);
-      nextTime += samples.length / SR;
+      // 訊框之後留一段靜音當聽窗 —— 兩台裝置只隔 2–3 cm，不可能同時收發
+      nextTime += samples.length / SR + ACK_WINDOW_SEC;
     }
     renderTx(tx);
   };
@@ -2730,6 +2920,27 @@ async function startSend() {
 
   $('sendStart').disabled = true;
   $('sendStop').disabled = false;
+}
+
+// 在最近的錄音裡找回報。發送端自己的訊框也在這段錄音裡，但資料訊框用正向
+// chirp、回報用反向 chirp，兩者的匹配濾波幾乎不互相響應（實測 626239 : 1），
+// 所以不會把自己的輸出誤認成回報。
+function checkForAck(tx) {
+  if (!state.txRec || !state.ackBuf.length) return;
+  const total = state.ackBuf.reduce((a, c) => a + c.length, 0);
+  if (total < SR * 2) return;
+  const buf = new Float32Array(total);
+  let o = 0;
+  for (const c of state.ackBuf) { buf.set(c, o); o += c.length; }
+  state.ackBuf = [];
+  const got = findAck(buf, currentBand());
+  if (!got) return;
+  if (tx.applyAck(got.ack)) {
+    state.ackFound++;
+    state.lastAckInfo = `缺 ${got.ack.needed.length} 段，相關 ${got.ratio.toFixed(0)}` +
+      (got.ack.done ? '，已收齊' : '');
+    log(`↩ 收到回報：${got.ack.done ? '接收端已收齊' : `還缺 ${got.ack.needed.length} 段`}`);
+  }
 }
 
 function renderTx(tx) {
@@ -2750,12 +2961,19 @@ function renderTx(tx) {
       : `<div class="drow info"><span>本段</span><b>已送 ${st.segRatio.toFixed(2)} × K` +
         `（接收端約需 1.1–1.6 × K）</b></div>`) +
     `<div class="drow info"><span>訊框 / 封包</span><b>${st.frames} / ${st.packets}</b></div>` +
-    `<div class="drow ${st.roundComplete ? 'ok' : 'info'}"><span>本輪</span><b>` +
-    `已涵蓋 ${st.covered} / ${st.segCount} 段${st.roundComplete ? '　→ 即將自動停止' : ''}</b></div>`;
+    `<div class="drow info"><span>本輪</span><b>第 ${st.rounds} 輪，已涵蓋 ${st.covered} / ${st.segCount} 段</b></div>` +
+    `<div class="drow ${st.ackCount ? 'ok' : 'warn'}"><span>回報</span><b>` +
+    (st.ackCount
+      ? `收到 ${st.ackCount} 次，已確認 ${st.ackedSegs} / ${st.segCount} 段${state.lastAckInfo ? `（${state.lastAckInfo}）` : ''}`
+      : '尚未收到 —— 若一直是 0，可能是聽窗時序對不上，見下方說明') +
+    `</b></div>`;
 }
 
 async function stopSend() {
   state.txSpec?.detach(); state.txSpec = null;
+  if (state.txRec?.worklet) state.txRec.node.port.postMessage('stop');
+  state.txMic?.getTracks().forEach((t) => t.stop());
+  state.txMic = null; state.txRec = null; state.ackBuf = [];
   clearInterval(state.timer);
   state.timer = null;
   state.tx = null;
@@ -2878,7 +3096,15 @@ async function startReceive() {
   };
   const queue = [];
 
-  const rec = await makeRecorder(ctx, (chunk) => queue.push(chunk));
+  // 記錄「錄到第幾個 sample」與「當下的 AudioContext 時間」，
+  // 這兩個數字是把訊框位置換算成輸出排程時間的唯一依據。
+  state.recorded = 0;
+  state.recordedAt = 0;
+  const rec = await makeRecorder(ctx, (chunk) => {
+    queue.push(chunk);
+    state.recorded += chunk.length;
+    state.recordedAt = ctx.currentTime;
+  });
   const mute = ctx.createGain();
   mute.gain.value = 0;
   const src = ctx.createMediaStreamSource(stream);
@@ -2906,19 +3132,64 @@ async function startReceive() {
   state.node = rec.node;
   state.worklet = rec.worklet;
 
+  // 回報要送得出去，接收端也得有輸出路徑
+  state.ackGain = ctx.createGain();
+  state.ackGain.connect(ctx.destination);
+  state.inLatency = stream.getAudioTracks()[0].getSettings().latency ?? 0.02;
+  state.outLatency = (ctx.baseLatency ?? 0) + (ctx.outputLatency ?? 0);
+  state.acksSent = 0;
+  state.lastAckLead = null;
+  state.ackedFrameEnd = -1;
   log(`開始接收（${currentBand()}，調變自動偵測）。解調排在主執行緒分次做 —— 實機有 12× 即時餘裕。`);
+  log(`回報時序：輸入延遲 ${(state.inLatency * 1000).toFixed(0)} ms、輸出延遲 ${(state.outLatency * 1000).toFixed(0)} ms`);
 
   // 解調很吃 CPU，排在計時器裡分次做，避免卡住 UI；
   // 錄音本身跑在音訊執行緒，不受影響。
   state.timer = setInterval(() => {
     if (!state.rx) return;
     while (queue.length) rx.push(queue.shift());
+    sendAckIfDue(ctx, rx);
     renderProgress();
     if (rx.done) finishReceive();
   }, 250);
 
   $('recvStart').disabled = true;
   $('recvStop').disabled = false;
+}
+
+/**
+ * 在發送端的聽窗裡送出回報。
+ *
+ * 時序推導：訊框的最後一個 sample 落在全域位置 E，它被「錄到」的牆鐘時刻約為
+ *   tCapture = recordedAt − (recorded − E)/SR
+ * 那段聲音是發送端在 tCapture − 輸入延遲 時發出的，所以它的聽窗也從那時開始。
+ * 我們的聲音要在窗中央抵達對方，就得提前輸出延遲那麼多送出。
+ *
+ * 誤差來自兩端延遲的估計。窗開 0.8 s、回報只有 0.31 s，容許 ±244 ms。
+ */
+function sendAckIfDue(ctx, rx) {
+  if (!rx.file || rx.lastFrameEnd === null || rx.lastFrameEnd === state.ackedFrameEnd) return;
+  state.ackedFrameEnd = rx.lastFrameEnd;
+
+  const tCapture = state.recordedAt - (state.recorded - rx.lastFrameEnd) / SR;
+  const windowStart = tCapture - state.inLatency;
+  const beaconSec = ackFrameSamples(currentBand()) / SR;
+  const when = windowStart + (ACK_WINDOW_SEC - beaconSec) / 2 - state.outLatency;
+  const lead = when - ctx.currentTime;
+  state.lastAckLead = lead;
+  // 已經來不及就跳過這一次 —— 硬送會落在對方的資料訊框上，反而干擾
+  if (lead < 0.01) return;
+
+  const needed = rx.neededSegments();
+  const payload = encodeAck({ hash8: rx.file.hash8, done: rx.done, needed });
+  const samples = modulateAck(currentBand(), payload);
+  const buf = ctx.createBuffer(1, samples.length, SR);
+  buf.copyToChannel(samples, 0);
+  const src = ctx.createBufferSource();
+  src.buffer = buf;
+  src.connect(state.ackGain);
+  src.start(ctx.currentTime + lead);
+  state.acksSent++;
 }
 
 function renderProgress() {
@@ -2965,6 +3236,9 @@ function renderProgress() {
     `（遺失 ${((st.packetsBad / Math.max(1, st.packetsGood + st.packetsBad)) * 100).toFixed(1)}%）</b></div>` +
     `<div class="drow info"><span>通道</span><b>SNR ${st.snrDb?.toFixed(1) ?? '--'} dB，` +
     `時脈 ${st.rhoPpm?.toFixed(0) ?? '--'} ppm　調變 ${st.detectedMod ?? '偵測中'}</b></div>` +
+    `<div class="drow info"><span>回報</span><b>已送 ${state.acksSent ?? 0} 次` +
+    `${state.lastAckLead !== null ? `　提前量 ${(state.lastAckLead * 1000).toFixed(0)} ms` : ''}` +
+    `${state.lastAckLead !== null && state.lastAckLead < 0.01 ? '（來不及，已跳過）' : ''}</b></div>` +
     (st.snrDb !== null && st.snrDb < 11 && st.detectedMod === 'qpsk'
       ? `<div class="drow warn"><span>建議</span><b>SNR 偏低，發送端改用 BPSK 會更快</b></div>` : '');
 }
@@ -3011,6 +3285,7 @@ async function finishReceive() {
 
 async function stopReceive() {
   state.rxSpec?.detach(); state.rxSpec = null;
+  state.ackGain = null;
   clearInterval(state.timer);
   state.timer = null;
   state.rx = null;

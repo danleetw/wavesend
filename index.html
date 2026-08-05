@@ -102,7 +102,7 @@ h1 #ver { font-size: 13px; font-weight: 400; color: var(--muted); margin-left: 6
 
 </head>
 <body>
-<h1>wavesync <span id="ver">V26.0805 23:00</span></h1>
+<h1>wavesync <span id="ver">V26.0805 23:15</span></h1>
 <p class="sub">用聲音把檔案從一台裝置送到另一台。無網路、無配對、無伺服器。</p>
 
 <section class="card">
@@ -1676,14 +1676,18 @@ function choosePacketLayout(bitsPerSymbol, targetBytes = 96) {
 // 不能假設它收得到第一個封包。重播成本很低（每 16 個封包插一個）。
 //
 //   [ ver:1 | blockSize:2 | segIndex:3 | segCount:3 | segBlocks:3 |
-//     segOffset:6 | fileSize:6 | hash8:8 | nameLen:1 | name:UTF-8 ]
+//     blocksPerSeg:3 | segOffset:6 | fileSize:6 | hash8:8 | nameLen:1 | name:UTF-8 ]
+//
+// blocksPerSeg 是「每一段有幾塊」的常數（最後一段可能不足）。續傳時要注入
+// 一個先前收好的段，必須知道它的位移，但 manifest 只帶「目前這一段」的位移。
+// 靠兩端共用同一個預設段長來推是脆弱的 —— 改成直接帶，3 bytes 買到不必約定。
 //
 // 長度欄位用 6 bytes（256 TB）而不是 4 bytes：4 bytes 上限只有 4 GB，
 // 而使用者一開口就是 10 GB 的模型檔 —— 就算那個尺寸實際上傳不完，
 // 也不該讓格式本身先爆掉。
 
-const MANIFEST_VERSION = 2;
-const FIXED = 1 + 2 + 3 + 3 + 3 + 6 + 6 + 8 + 1;
+const MANIFEST_VERSION = 3;
+const FIXED = 1 + 2 + 3 + 3 + 3 + 3 + 6 + 6 + 8 + 1;
 
 const w24 = (o, a, v) => { a[o] = (v >> 16) & 0xff; a[o + 1] = (v >> 8) & 0xff; a[o + 2] = v & 0xff; };
 const r24 = (o, a) => (a[o] << 16) | (a[o + 1] << 8) | a[o + 2];
@@ -1708,11 +1712,12 @@ function encodeManifest(m) {
   w24(3, out, m.segIndex);
   w24(6, out, m.segCount);
   w24(9, out, m.segBlocks);
-  w48(12, out, m.segOffset);
-  w48(18, out, m.fileSize);
-  out.set(m.hash8.subarray(0, 8), 24);
-  out[32] = trimmed.length;
-  out.set(trimmed, 33);
+  w24(12, out, m.blocksPerSeg);
+  w48(15, out, m.segOffset);
+  w48(21, out, m.fileSize);
+  out.set(m.hash8.subarray(0, 8), 27);
+  out[35] = trimmed.length;
+  out.set(trimmed, 36);
   return out;
 }
 
@@ -1723,16 +1728,18 @@ function decodeManifest(buf) {
   const segIndex = r24(3, buf);
   const segCount = r24(6, buf);
   const segBlocks = r24(9, buf);
-  const segOffset = r48(12, buf);
-  const fileSize = r48(18, buf);
-  const hash8 = buf.slice(24, 32);
-  const nameLen = buf[32];
-  if (33 + nameLen > buf.length) return null;
-  const name = new TextDecoder().decode(buf.subarray(33, 33 + nameLen));
-  if (blockSize <= 0 || segBlocks <= 0 || fileSize <= 0) return null;
+  const blocksPerSeg = r24(12, buf);
+  const segOffset = r48(15, buf);
+  const fileSize = r48(21, buf);
+  const hash8 = buf.slice(27, 35);
+  const nameLen = buf[35];
+  if (36 + nameLen > buf.length) return null;
+  const name = new TextDecoder().decode(buf.subarray(36, 36 + nameLen));
+  if (blockSize <= 0 || segBlocks <= 0 || fileSize <= 0 || blocksPerSeg <= 0) return null;
+  if (segBlocks > blocksPerSeg) return null;
   if (segCount <= 0 || segIndex >= segCount) return null;
   if (segOffset >= fileSize) return null;
-  return { blockSize, segIndex, segCount, segBlocks, segOffset, fileSize, hash8, name };
+  return { blockSize, segIndex, segCount, segBlocks, blocksPerSeg, segOffset, fileSize, hash8, name };
 }
 
 function manifestOverhead() { return FIXED; }
@@ -1887,7 +1894,10 @@ const MANIFEST_EVERY = 16;        // 每這麼多個封包插一個 manifest
 // 當喇叭的可聽互調逼得輸出必須調低時，這是唯一還能維持鏈路的辦法。
 const MODULATION = { qpsk: 2, bpsk: 1 };
 const DEFAULT_SEGMENT_BYTES = 1024 * 1024;
-const SEGMENT_BUDGET = 1.8;       // 沒有 ACK 時，每段送到這個倍率就換下一段
+// 沒有 ACK 時，每段送到這個倍率就換下一段。接收端實測需要 1.1–1.6×K，
+// 1.8 留了餘裕。送完所有段就停 —— 沒有這個終止條件的話，發送端會永遠播下去，
+// 使用者忘了按停止就會有一個看不見的分頁在背景一直發聲（實際發生過）。
+const SEGMENT_BUDGET = 1.8;
 
 function sessionLayout(band, mod = 'qpsk') {
   const plan = makePlan({ band, fallbackBits: MODULATION[mod] ?? 2 });
@@ -1929,6 +1939,9 @@ class SendSession {
 
     this.segIndex = 0;
     this.acked = new Set();          // 由 ACK 標記已完成的段（目前尚無 ACK 通道）
+    this.covered = new Set();        // 這一輪已經送過的段
+    this.roundComplete = false;
+    this.rounds = 1;
     this.packetsInSeg = 0;
     this.packetCount = 0;
     this.frameCount = 0;
@@ -1950,6 +1963,7 @@ class SendSession {
       segIndex: i,
       segCount: this.segCount,
       segBlocks: this.encoder.k,
+      blocksPerSeg: Math.ceil(this.perSeg / this.layout.payloadSize),
       segOffset: this.segOffset,
       fileSize: this.bytes.length,
       hash8: this.hash,
@@ -1964,11 +1978,22 @@ class SendSession {
   }
 
   _advance() {
+    this.covered.add(this.segIndex);
     for (let n = 1; n <= this.segCount; n++) {
       const i = (this.segIndex + n) % this.segCount;
-      if (!this.acked.has(i)) { this._openSegment(i); return; }
+      if (!this.acked.has(i) && !this.covered.has(i)) { this._openSegment(i); return; }
     }
-    this.allAcked = true;
+    // 每一段都送過一輪了。接收端若還沒收齊，可以再跑一次 —— 已收好的段
+    // 會由續傳保留，不用重來。
+    this.roundComplete = true;
+  }
+
+  /** 再跑一輪（接收端沒收齊時用） */
+  nextRound() {
+    this.covered.clear();
+    this.roundComplete = false;
+    this._openSegment(0);
+    this.rounds++;
   }
 
   get segmentProgress() { return this.packetsInSeg / (this.encoder.k * SEGMENT_BUDGET); }
@@ -1988,7 +2013,7 @@ class SendSession {
         this.packetsInSeg++;
         this.payloadBytesSent += payloadSize;
         // 沒有 ACK 時只能靠預算換段：送滿 1.8×K 通常遠超過接收端所需的 1.1–1.6×K
-        if (this.segCount > 1 && this.packetsInSeg >= this.encoder.k * SEGMENT_BUDGET) this._advance();
+        if (this.packetsInSeg >= this.encoder.k * SEGMENT_BUDGET) this._advance();
       }
       this.packetCount++;
     }
@@ -2005,6 +2030,9 @@ class SendSession {
       bytesSent: this.payloadBytesSent,
       fileSize: this.bytes.length,
       segRatio: this.packetsInSeg / this.encoder.k,
+      covered: this.covered.size,
+      roundComplete: this.roundComplete,
+      rounds: this.rounds,
     };
   }
 }
@@ -2051,9 +2079,41 @@ class ReceiveSession {
     this.syncAttempts = 0;
     this.result = null;
     this.hashOk = null;
+    // 續傳掛鉤：外部（UI 層）負責持久化。IndexedDB 是非同步的，
+    // 而解調迴圈是同步的 —— 混在一起會讓那條熱路徑難以推理，
+    // 所以這裡只提供同步的注入點與回呼。
+    this.onFileKnown = null;      // (fileInfo) => void，收到 manifest 時觸發一次
+    this.onSegmentDone = null;    // (index, bytes) => void
+    this.injectedCount = 0;
   }
 
   get done() { return this.result !== null; }
+
+  /**
+   * 注入一個已知正確的段（來自先前中斷的傳輸）。
+   * 必須在收到 manifest 之後呼叫 —— 那時才知道段的位移與長度。
+   * @returns {boolean} 是否採用
+   */
+  injectSegment(index, bytes) {
+    if (!this.file || this.done) return false;
+    if (index < 0 || index >= this.file.segCount) return false;
+    if (this.file.perSeg === null) return false;   // 段長推不出來就不敢注入
+    const existing = this.segments.get(index);
+    if (existing?.bytes) return false;
+    const offset = existing?.offset ?? index * this.file.perSeg;
+    const want = Math.min(bytes.length, this.file.fileSize - offset);
+    if (want <= 0) return false;
+    this.segments.set(index, {
+      decoder: null,
+      bytes: bytes.subarray(0, want),
+      offset: existing?.offset ?? offset,
+      blocks: existing?.blocks ?? 0,
+    });
+    this.bytesRecovered += want;
+    this.injectedCount++;
+    if (this.completedSegments === this.file.segCount && !this.result) this._finalise();
+    return true;
+  }
 
   get progress() {
     if (!this.file) return 0;
@@ -2197,10 +2257,13 @@ class ReceiveSession {
 
   _applyManifest(m) {
     if (!this.file) {
+      // 段長直接來自 manifest，不靠任何兩端約定 —— 注入續傳的段時要用它算位移
       this.file = {
         name: m.name, fileSize: m.fileSize, segCount: m.segCount,
         hash8: m.hash8, blockSize: m.blockSize,
+        perSeg: m.blocksPerSeg * m.blockSize,
       };
+      this.onFileKnown?.(this.file);
     } else if (this.file.fileSize !== m.fileSize || !this.file.hash8.every((v, i) => v === m.hash8[i])) {
       return null;              // 換了別的檔案，忽略
     }
@@ -2217,6 +2280,8 @@ class ReceiveSession {
     s.bytes = s.decoder.recover(want);
     s.decoder = null;           // 釋放 pending 封包與剝離結構
     this.bytesRecovered += s.bytes.length;
+    // 找出這是第幾段才能回報給儲存層
+    for (const [i, v] of this.segments) if (v === s) { this.onSegmentDone?.(i, s.bytes); break; }
   }
 
   _finalise() {
@@ -2234,6 +2299,7 @@ class ReceiveSession {
       fileSize: this.file?.fileSize ?? 0,
       segCount: this.file?.segCount ?? 0,
       segDone: this.completedSegments,
+      segInjected: this.injectedCount,
       bytesRecovered: this.bytesRecovered,
       progress: this.progress,
       packetsGood: this.packetsGood,
@@ -2437,6 +2503,105 @@ class Spectrum {
   }
 }
 
+// ═══ store.js ══════════════════════════════════════════════════
+// 已完成段落的持久化儲存（IndexedDB）。
+//
+// 傳輸可能被中斷：手機被系統殺掉、分頁被切走、電池沒電、或人為停止。
+// 沒有持久化的話每次都要從頭來，而聲學傳輸本來就慢，重來一次的代價很高。
+//
+// 段是最小的完成單位 —— 收完一段就永久有效，重開後只要補沒收完的那些。
+// 以檔案雜湊當鍵，所以換了檔案不會誤用舊資料；同一個檔案換裝置重傳也認得出來。
+//
+// 這一層刻意放在 UI 而不是 ReceiveSession 裡：IndexedDB 是非同步的，
+// 而解調迴圈是同步的，混在一起會讓那條熱路徑變得難以推理。
+// Session 只提供 injectSegment() 這個同步入口。
+
+const DB_NAME = 'wavesync';
+const DB_VERSION = 1;
+const STORE = 'segments';
+
+function open() {
+  return new Promise((resolve, reject) => {
+    if (!globalThis.indexedDB) { reject(new Error('這個環境沒有 IndexedDB')); return; }
+    const req = indexedDB.open(DB_NAME, DB_VERSION);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(STORE)) {
+        // 鍵為 "檔案雜湊:段號"，值含段內容與最後更新時間
+        const os = db.createObjectStore(STORE, { keyPath: 'key' });
+        os.createIndex('file', 'file', { unique: false });
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+const tx = async (mode, fn) => {
+  const db = await open();
+  return new Promise((resolve, reject) => {
+    const t = db.transaction(STORE, mode);
+    const out = fn(t.objectStore(STORE));
+    t.oncomplete = () => { db.close(); resolve(out?.result ?? out); };
+    t.onerror = () => { db.close(); reject(t.error); };
+  });
+};
+
+const toHex = (b) => [...b].map((v) => v.toString(16).padStart(2, '0')).join('');
+
+class SegmentStore {
+  constructor() { this.available = !!globalThis.indexedDB; }
+
+  /** @param {Uint8Array} hash8 檔案雜湊前 8 bytes */
+  static fileKey(hash8, fileSize) { return `${toHex(hash8)}-${fileSize}`; }
+
+  async save(fileKey, index, bytes) {
+    if (!this.available) return false;
+    try {
+      await tx('readwrite', (os) => os.put({
+        key: `${fileKey}:${index}`, file: fileKey, index,
+        bytes: bytes.slice(), at: Date.now(),
+      }));
+      return true;
+    } catch { return false; }
+  }
+
+  /** @returns {Promise<Map<number, Uint8Array>>} */
+  async load(fileKey) {
+    const out = new Map();
+    if (!this.available) return out;
+    try {
+      const rows = await tx('readonly', (os) => os.index('file').getAll(fileKey));
+      for (const r of rows ?? []) out.set(r.index, new Uint8Array(r.bytes));
+    } catch { /* 讀不到就當作沒有進度 */ }
+    return out;
+  }
+
+  async clear(fileKey) {
+    if (!this.available) return;
+    try {
+      const rows = await tx('readonly', (os) => os.index('file').getAllKeys(fileKey));
+      await tx('readwrite', (os) => { for (const k of rows ?? []) os.delete(k); });
+    } catch { /* 清不掉不影響正確性，只是佔空間 */ }
+  }
+
+  /** 列出所有未完成的檔案，供 UI 顯示 */
+  async list() {
+    if (!this.available) return [];
+    try {
+      const rows = await tx('readonly', (os) => os.getAll());
+      const byFile = new Map();
+      for (const r of rows ?? []) {
+        const e = byFile.get(r.file) ?? { file: r.file, segments: 0, bytes: 0, at: 0 };
+        e.segments++; e.bytes += r.bytes.byteLength ?? r.bytes.length;
+        e.at = Math.max(e.at, r.at);
+        byFile.set(r.file, e);
+      }
+      return [...byFile.values()].sort((a, b) => b.at - a.at);
+    } catch { return []; }
+  }
+}
+
 // ═══ app.js ════════════════════════════════════════════════════
 // Step 2b：實際的檔案傳輸介面。
 //
@@ -2540,7 +2705,13 @@ async function startSend() {
     if (!state.tx) return;
     // 排程到 currentTime + LOOKAHEAD 為止。噴泉碼是無限串流，
     // 只能邊播邊產生，不能先做一大塊。
-    while (nextTime < ctx.currentTime + LOOKAHEAD_SEC) {
+    if (tx.roundComplete && nextTime <= ctx.currentTime + 0.3) {
+      log(`✓ 已完整送過每一段（第 ${tx.stats().rounds} 輪），自動停止。`);
+      log('  接收端若還沒收齊，再按一次開始傳送即可 —— 它已收好的段會保留，不用重來。');
+      stopSend();
+      return;
+    }
+    while (!tx.roundComplete && nextTime < ctx.currentTime + LOOKAHEAD_SEC) {
       const samples = tx.nextFrame();
       if (state.txGain !== 1) for (let i = 0; i < samples.length; i++) samples[i] *= state.txGain;
       const buf = ctx.createBuffer(1, samples.length, SR);
@@ -2578,7 +2749,9 @@ function renderTx(tx) {
         `本段已送 ${st.segRatio.toFixed(2)} × K</b></div>`
       : `<div class="drow info"><span>本段</span><b>已送 ${st.segRatio.toFixed(2)} × K` +
         `（接收端約需 1.1–1.6 × K）</b></div>`) +
-    `<div class="drow info"><span>訊框 / 封包</span><b>${st.frames} / ${st.packets}</b></div>`;
+    `<div class="drow info"><span>訊框 / 封包</span><b>${st.frames} / ${st.packets}</b></div>` +
+    `<div class="drow ${st.roundComplete ? 'ok' : 'info'}"><span>本輪</span><b>` +
+    `已涵蓋 ${st.covered} / ${st.segCount} 段${st.roundComplete ? '　→ 即將自動停止' : ''}</b></div>`;
 }
 
 async function stopSend() {
@@ -2687,6 +2860,22 @@ async function startReceive() {
   const rx = new ReceiveSession({ band: currentBand(), mod: 'auto' });
   state.rx = rx;
   state.t0 = performance.now();
+
+  // 續傳：manifest 一到就去查有沒有先前存下的段，有就直接注入。
+  // 這裡是非同步的，而解調迴圈是同步的 —— 注入慢個幾百毫秒無妨，
+  // 那些段本來就是「已經正確」的，晚一點併入不影響其他段繼續解。
+  const store = new SegmentStore();
+  rx.onFileKnown = async (file) => {
+    state.fileKey = SegmentStore.fileKey(file.hash8, file.fileSize);
+    const saved = await store.load(state.fileKey);
+    if (!saved.size) return;
+    let n = 0;
+    for (const [i, b] of saved) if (rx.injectSegment(i, b)) n++;
+    if (n) log(`↻ 續傳：從先前的傳輸取回 ${n} 段（${fmtBytes([...saved.values()].reduce((a, b) => a + b.length, 0))}）`);
+  };
+  rx.onSegmentDone = (i, bytes) => {
+    if (state.fileKey) store.save(state.fileKey, i, bytes);
+  };
   const queue = [];
 
   const rec = await makeRecorder(ctx, (chunk) => queue.push(chunk));
@@ -2769,6 +2958,7 @@ function renderProgress() {
     `${eta !== null ? `　剩餘約 ${fmtSec(eta)}` : ''}</b></div>` +
     (st.segCount > 1
       ? `<div class="drow info"><span>分段</span><b>完成 ${st.segDone} / ${st.segCount} 段` +
+        `${st.segInjected ? `（其中 ${st.segInjected} 段來自續傳）` : ''}` +
         `${Number.isFinite(st.activeRatio) ? `　目前段收到 ${st.activeRatio.toFixed(2)} × K` : ''}</b></div>`
       : '') +
     `<div class="drow info"><span>封包</span><b>好 ${st.packetsGood} / 壞 ${st.packetsBad}` +
@@ -2802,6 +2992,8 @@ async function finishReceive() {
     }
   }
   log(`  ${r.name}（${fmtBytes(r.bytes.length)}）`);
+  // 收齊了就把暫存清掉，不然會一直佔著空間
+  if (state.fileKey) { new SegmentStore().clear(state.fileKey); state.fileKey = null; }
   log(`  耗時 ${fmtSec(secs)}，實測 ${(r.bytes.length / secs).toFixed(0)} B/s`);
   log(`  SHA-256 ${r.hashOk ? '✓ 相符' : '✗ 不符 —— 資料有誤'}`);
   log(`  ${rx.file.segCount} 段全部完成，封包 好 ${rx.packetsGood} / 壞 ${rx.packetsBad}`);

@@ -92,11 +92,17 @@ canvas.spec { width: 100%; height: 150px; display: block; margin-top: 12px;
 
 h1 #ver { font-size: 13px; font-weight: 400; color: var(--muted); margin-left: 6px;
   font-family: ui-monospace, Consolas, monospace; letter-spacing: 0; }
+
+.meter { position: relative; height: 44px; border-radius: 8px; overflow: hidden;
+  background: var(--line); margin-top: 12px; }
+.meter i { position: absolute; inset: 0; width: 0; transition: width 0.12s linear, background 0.3s; }
+.meter b { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+  font-size: 16px; font-weight: 600; color: var(--fg); text-shadow: 0 0 6px var(--bg); }
 </style>
 
 </head>
 <body>
-<h1>wavesync <span id="ver">V26.0805 22:55</span></h1>
+<h1>wavesync <span id="ver">V26.0805 23:00</span></h1>
 <p class="sub">用聲音把檔案從一台裝置送到另一台。無網路、無配對、無伺服器。</p>
 
 <section class="card">
@@ -171,6 +177,8 @@ h1 #ver { font-size: 13px; font-weight: 400; color: var(--muted); margin-left: 6
     <button id="recvStart">開始接收</button>
     <button id="recvStop" disabled>停止</button>
   </div>
+  <div id="meter" class="meter"><i id="meterBar"></i><b id="meterText">等待訊號…</b></div>
+  <p class="hint">喬位置時看這一條就好 —— 它每秒更新 60 次，不必等訊框。綠色就可以放手。</p>
   <canvas id="rxSpec" class="spec"></canvas>
   <p class="hint" id="rxLevel"></p>
   <div class="progress"><i id="bar"></i></div>
@@ -2115,7 +2123,10 @@ class ReceiveSession {
     this.searchFrom = this.base + start + this.frameSamples - PREAMBLE_LEN;
 
     const picked = this._demodulate(frame);
-    if (!picked) return true;
+    // 解不開也要把通道數值記下來：使用者在喬位置時，這是唯一的回饋來源。
+    // 原本只在成功時更新，導致訊號不好時畫面完全凍住，只能盲喬。
+    if (picked?.r) { this.lastSnrDb = picked.r.snrDb; this.lastRhoPpm = picked.r.rhoPpm; }
+    if (!picked || picked.empty) return true;
 
     this.framesDecoded++;
     this.lastSnrDb = picked.r.snrDb;
@@ -2145,13 +2156,14 @@ class ReceiveSession {
       const c = tryOne(m);
       if (c && (!best || c.good > best.good)) best = c;
     }
+    // 即使一個好封包都沒有，也把解調結果帶回去 —— 呼叫端要用它的 SNR
     if (!best) return null;
     // 兩個 CRC 正確的封包才鎖定 —— 單一封包有可能是巧合
     if (best.good >= 2) {
       this.detectedMod = best.mod;
       Object.assign(this, best.layout);
     }
-    return best.good > 0 ? best : null;
+    return best.good > 0 ? best : { ...best, empty: true };
   }
 
   _consumePackets(bytes, L = this) {
@@ -2648,6 +2660,8 @@ function resetReceiveUi() {
 
   $('rxProgress').innerHTML = '';
   $('rxLevel').textContent = '';
+  $('meterBar').style.width = '0';
+  $('meterText').textContent = '等待訊號…';
 }
 
 async function startReceive() {
@@ -2682,14 +2696,22 @@ async function startReceive() {
   src.connect(rec.node).connect(mute).connect(ctx.destination);
 
   state.rxSpec = new Spectrum($('rxSpec'), BANDS[currentBand()]);
+  // 訊框每 3.1 秒才一個，用它當喬位置的回饋太慢（實測使用者花 30 秒盲喬、
+  // 只為了傳 8 bytes）。頻譜每秒更新 60 次，拿它驅動一個大的強度計，
+  // 使用者才有「越來越好」的即時感。
   state.rxSpec.onLevel = (inB, ref) => {
     const snr = inB - ref;
-    const verdict = inB < -95 ? '訊號沒進來 —— 確認發送端在播、頻帶兩端一致'
-      : snr < 6 ? '訊號太弱 —— 靠更近、加大音量'
-      : snr < 12 ? '勉強，可改用 BPSK'
-      : '位準足夠';
-    $('rxLevel').textContent = `頻帶內 ${inB.toFixed(0)} dB　底噪 ${ref.toFixed(0)} dB　` +
-      `差 ${snr.toFixed(0)} dB　→ ${verdict}`;
+    const [pct, color, text] =
+      inB < -95 ? [0, 'var(--bad)', '沒有訊號 —— 確認發送端在播、兩端模式一致']
+      : snr < 6 ? [Math.max(6, (snr / 6) * 25), 'var(--bad)', `太弱（${snr.toFixed(0)} dB）—— 靠更近、加大音量`]
+      : snr < 12 ? [25 + ((snr - 6) / 6) * 30, 'var(--warn)', `勉強（${snr.toFixed(0)} dB）—— 再靠近一點`]
+      : snr < 20 ? [55 + ((snr - 12) / 8) * 30, 'var(--ok)', `良好（${snr.toFixed(0)} dB）`]
+      : [Math.min(100, 85 + (snr - 20)), 'var(--ok)', `很好（${snr.toFixed(0)} dB）`];
+    const bar = $('meterBar');
+    bar.style.width = `${pct}%`;
+    bar.style.background = color;
+    $('meterText').textContent = text;
+    $('rxLevel').textContent = `頻帶內 ${inB.toFixed(0)} dB　底噪 ${ref.toFixed(0)} dB　差 ${snr.toFixed(0)} dB`;
   };
   state.rxSpec.attach(ctx, src);
   state.node = rec.node;

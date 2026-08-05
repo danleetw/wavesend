@@ -102,7 +102,7 @@ h1 #ver { font-size: 13px; font-weight: 400; color: var(--muted); margin-left: 6
 
 </head>
 <body>
-<h1>wavesync <span id="ver">V26.0805 23:47</span></h1>
+<h1>wavesync <span id="ver">V26.0806 00:06</span></h1>
 <p class="sub">用聲音把檔案從一台裝置送到另一台。無網路、無配對、無伺服器。</p>
 
 <section class="card">
@@ -3216,10 +3216,19 @@ function renderProgress() {
     `</b></div>`;
 
   if (!st.name) {
+    // 沒有 manifest 時也要顯示封包統計 —— 少了它就分不出
+    // 「訊框解得開但 manifest 剛好都壞掉」和「封包全壞」，
+    // 而這兩者的處理方式完全不同。
     el.innerHTML = syncRow +
       `<div class="drow info"><span>狀態</span><b>` +
       (st.framesSeen ? '已鎖定但還沒收到檔案資訊…' : '找不到前導訊號') +
-      `（已聽 ${fmtSec(secs)}）</b></div>`;
+      `（已聽 ${fmtSec(secs)}）</b></div>` +
+      `<div class="drow ${st.packetsGood ? 'info' : 'bad'}"><span>封包</span><b>` +
+      `好 ${st.packetsGood} / 壞 ${st.packetsBad}` +
+      `（遺失 ${((st.packetsBad / Math.max(1, st.packetsGood + st.packetsBad)) * 100).toFixed(1)}%）　` +
+      `調變 ${st.detectedMod ?? '偵測中'}</b></div>` +
+      `<div class="drow info"><span>通道</span><b>SNR ${st.snrDb?.toFixed(1) ?? '--'} dB，` +
+      `時脈 ${st.rhoPpm?.toFixed(0) ?? '--'} ppm</b></div>`;
     return;
   }
 
@@ -3333,7 +3342,15 @@ document.querySelectorAll('input[name=band], input[name=mod]').forEach((el) => {
   };
 });
 
-window.__wavesync = { SendSession, ReceiveSession, sessionLayout, SR, encryptFile, decryptFile, isEncrypted };
+// 對測工具直接讀內部狀態，比刮畫面文字可靠得多
+window.__wavesync = {
+  SendSession, ReceiveSession, sessionLayout, SR, encryptFile, decryptFile, isEncrypted,
+  snapshot: () => ({
+    rx: state.rx ? { ...state.rx.stats(), acksSent: state.acksSent ?? 0, ackLead: state.lastAckLead } : null,
+    tx: state.tx ? state.tx.stats() : null,
+    gainDb: state.txGainDb ?? null,
+  }),
+};
 
 setRole(document.querySelector('input[name=role]:checked').value);
 diagnose();

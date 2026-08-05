@@ -96,7 +96,7 @@ h1 #ver { font-size: 13px; font-weight: 400; color: var(--muted); margin-left: 6
 
 </head>
 <body>
-<h1>wavesync <span id="ver">V26.0805 22:17</span></h1>
+<h1>wavesync <span id="ver">V26.0805 22:31</span></h1>
 <p class="sub">用聲音把檔案從一台裝置送到另一台。無網路、無配對、無伺服器。</p>
 
 <section class="card">
@@ -157,6 +157,9 @@ h1 #ver { font-size: 13px; font-weight: 400; color: var(--muted); margin-left: 6
     <button id="sendStart">開始傳送</button>
     <button id="sendStop" disabled>停止</button>
   </div>
+  <canvas id="txSpec" class="spec"></canvas>
+  <p class="hint" id="txLevel"></p>
+  <div id="txProgress" class="diag" style="margin-top:10px"></div>
   <p class="hint">噴泉碼沒有「送完」的概念 —— 它會一直產生新封包，直到你按停止。接收端湊夠就會自己完成。</p>
 </section>
 

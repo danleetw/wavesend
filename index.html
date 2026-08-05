@@ -96,7 +96,7 @@ h1 #ver { font-size: 13px; font-weight: 400; color: var(--muted); margin-left: 6
 
 </head>
 <body>
-<h1>wavesync <span id="ver">V26.0805 22:39</span></h1>
+<h1>wavesync <span id="ver">V26.0805 22:45</span></h1>
 <p class="sub">用聲音把檔案從一台裝置送到另一台。無網路、無配對、無伺服器。</p>
 
 <section class="card">
@@ -123,10 +123,12 @@ h1 #ver { font-size: 13px; font-weight: 400; color: var(--muted); margin-left: 6
     <span style="color:var(--muted);font-size:13px">調變</span>
     <label><input type="radio" name="mod" value="qpsk" checked> QPSK（快）</label>
     <label><input type="radio" name="mod" value="bpsk"> BPSK（穩，速率減半）</label>
+    <span style="color:var(--muted);font-size:12px">接收端會自動偵測，只有發送端需要選</span>
   </div>
   <div id="bandInfo" class="diag" style="margin-top:10px"></div>
-  <p class="hint">兩端必須選同一個（模式與調變都是）。Stealth 幾乎沒人聽得見；Turbo 快 5 倍但聲音像數據機撥號。
-  BPSK 的門檻比 QPSK 低 4.8 dB —— 若為了避免可聽的互調失真而必須把輸出調得很低，改用 BPSK 才撐得住。</p>
+  <p class="hint">兩端的<b>模式</b>必須一致；<b>調變</b>只有發送端要選，接收端會自己判斷。Stealth 幾乎沒人聽得見；Turbo 快 5 倍但聲音像數據機撥號。
+  BPSK 的門檻比 QPSK 低 4.8 dB。接收端顯示的 SNR 若低於 11 dB，就該改用 BPSK ——
+  QPSK 在那個位準下封包會大量壞掉（實測 8.2 dB 時遺失 83.6%），改 BPSK 反而更快。</p>
 </section>
 
 <section class="card">
@@ -1865,7 +1867,13 @@ const CRYPTO_OVERHEAD = HEADER + 16;
 //
 // 調變可選 QPSK 或 BPSK（見 MODULATION）。不做自適應 bit-loading 是因為
 // 那需要接收端把通道回報給發送端，而目前是單向廣播。
-const TARGET_FRAME_SEC = 3;
+// 每個訊框固定這麼多個資料符元 —— 不隨調變改變。
+//
+// 若讓 packetsPerFrame 去湊目標秒數，QPSK 與 BPSK 會得到不同的訊框長度
+// （125 vs 130 個符元），接收端就無法在不知道調變的情況下切出訊框，
+// 也就不可能自動偵測。固定成 120 可被兩種調變的封包符元數整除
+// （QPSK 24×5、BPSK 12×10；turbo 是 120×1 與 60×2），沒有浪費。
+const FRAME_DATA_SYMBOLS = 120;
 const MANIFEST_EVERY = 16;        // 每這麼多個封包插一個 manifest
 // QPSK（2 bit）或 BPSK（1 bit）。BPSK 速率減半，但門檻低 4.8 dB ——
 // 當喇叭的可聽互調逼得輸出必須調低時，這是唯一還能維持鏈路的辦法。
@@ -1876,8 +1884,8 @@ const SEGMENT_BUDGET = 1.8;       // 沒有 ACK 時，每段送到這個倍率�
 function sessionLayout(band, mod = 'qpsk') {
   const plan = makePlan({ band, fallbackBits: MODULATION[mod] ?? 2 });
   const layout = choosePacketLayout(plan.bitsPerSymbol);
-  const packetsPerFrame = Math.max(1, Math.round((TARGET_FRAME_SEC * SR) / SYM / layout.symbols));
-  const dataSymbols = packetsPerFrame * layout.symbols;
+  const packetsPerFrame = Math.max(1, Math.floor(FRAME_DATA_SYMBOLS / layout.symbols));
+  const dataSymbols = FRAME_DATA_SYMBOLS;
   const frameSamples = PREAMBLE_LEN + (PROBE_SYMS + dataSymbols) * SYM;
   return {
     plan, layout, packetsPerFrame, dataSymbols, frameSamples,
@@ -1996,10 +2004,22 @@ class SendSession {
 // ---------------------------------------------------------------- 接收
 
 class ReceiveSession {
-  constructor({ band, mod = 'qpsk' }) {
-    Object.assign(this, sessionLayout(band, mod));
+  /**
+   * @param {{band:string, mod?:'qpsk'|'bpsk'|'auto'}} opts
+   *
+   * mod='auto' 會同時用兩種調變各解一次，看哪一個的 CRC 過得多就選哪個。
+   * 這消掉一整類使用者錯誤 —— 兩端要對齊「頻帶＋調變＋密碼」三件事，
+   * 調變對不上時的症狀（同步正常但封包全壞）跟「訊號太弱」一模一樣，
+   * 光看數字分辨不出來。實機解調有 9 倍即時餘裕，多解一次付得起。
+   */
+  constructor({ band, mod = 'auto' }) {
     this.band = band;
     this.mod = mod;
+    this.candidates = mod === 'auto' ? ['qpsk', 'bpsk'] : [mod];
+    this.layouts = new Map(this.candidates.map((m) => [m, sessionLayout(band, m)]));
+    // 訊框長度刻意設計成與調變無關，否則不知道調變就切不出訊框
+    Object.assign(this, this.layouts.get(this.candidates[0]));
+    this.detectedMod = this.candidates.length === 1 ? this.candidates[0] : null;
     this.chirp = makeChirp(this.plan.spec.fLow, this.plan.spec.fHigh);
 
     this.buf = new Float32Array(this.frameSamples * 4);
@@ -2094,24 +2114,51 @@ class ReceiveSession {
     const frame = this.buf.subarray(start, start + this.frameSamples);
     this.searchFrom = this.base + start + this.frameSamples - PREAMBLE_LEN;
 
-    let r;
-    try {
-      r = demodulate(frame, this.plan, { symbols: this.dataSymbols });
-    } catch { return true; }
-    if (!r.ok) return true;
+    const picked = this._demodulate(frame);
+    if (!picked) return true;
 
     this.framesDecoded++;
-    this.lastSnrDb = r.snrDb;
-    this.lastRhoPpm = r.rhoPpm;
-    this._consumePackets(r.bytes);
+    this.lastSnrDb = picked.r.snrDb;
+    this.lastRhoPpm = picked.r.rhoPpm;
+    this._consumePackets(picked.r.bytes, picked.layout);
     return true;
   }
 
-  _consumePackets(bytes) {
-    const { totalBytes, payloadSize } = this.layout;
+  // 已鎖定調變就只解一次；還沒鎖定就兩種都試，用 CRC 通過數當裁判。
+  _demodulate(frame) {
+    const tryOne = (m) => {
+      const L = this.layouts.get(m);
+      let r;
+      try { r = demodulate(frame, L.plan, { symbols: L.dataSymbols }); } catch { return null; }
+      if (!r.ok) return null;
+      let good = 0;
+      for (let i = 0; i < L.packetsPerFrame; i++) {
+        if (readPacket(r.bytes, i * L.layout.totalBytes, L.layout.payloadSize)) good++;
+      }
+      return { mod: m, r, good, layout: L };
+    };
+
+    if (this.detectedMod) return tryOne(this.detectedMod);
+
+    let best = null;
+    for (const m of this.candidates) {
+      const c = tryOne(m);
+      if (c && (!best || c.good > best.good)) best = c;
+    }
+    if (!best) return null;
+    // 兩個 CRC 正確的封包才鎖定 —— 單一封包有可能是巧合
+    if (best.good >= 2) {
+      this.detectedMod = best.mod;
+      Object.assign(this, best.layout);
+    }
+    return best.good > 0 ? best : null;
+  }
+
+  _consumePackets(bytes, L = this) {
+    const { totalBytes, payloadSize } = L.layout;
     let current = null;
 
-    for (let i = 0; i < this.packetsPerFrame; i++) {
+    for (let i = 0; i < L.packetsPerFrame; i++) {
       const p = readPacket(bytes, i * totalBytes, payloadSize);
       if (!p) { this.packetsBad++; continue; }
       this.packetsGood++;
@@ -2181,6 +2228,7 @@ class ReceiveSession {
       packetsBad: this.packetsBad,
       framesDecoded: this.framesDecoded,
       framesSeen: this.framesSeen,
+      detectedMod: this.detectedMod,
       syncAttempts: this.syncAttempts,
       bestSyncRatio: this.bestSyncRatio,
       snrDb: this.lastSnrDb,
@@ -2616,7 +2664,7 @@ async function startReceive() {
   state.ctx = ctx;
   if (ctx.sampleRate !== SR) log(`⚠ AudioContext 是 ${ctx.sampleRate} Hz，解調會偏移。`);
 
-  const rx = new ReceiveSession({ band: currentBand(), mod: currentMod() });
+  const rx = new ReceiveSession({ band: currentBand(), mod: 'auto' });
   state.rx = rx;
   state.t0 = performance.now();
   const queue = [];
@@ -2641,7 +2689,7 @@ async function startReceive() {
   state.node = rec.node;
   state.worklet = rec.worklet;
 
-  log(`開始接收（${currentBand()} / ${currentMod()}）。解調排在主執行緒分次做 —— 實機有 12× 即時餘裕。`);
+  log(`開始接收（${currentBand()}，調變自動偵測）。解調排在主執行緒分次做 —— 實機有 12× 即時餘裕。`);
 
   // 解調很吃 CPU，排在計時器裡分次做，避免卡住 UI；
   // 錄音本身跑在音訊執行緒，不受影響。
@@ -2698,7 +2746,9 @@ function renderProgress() {
     `<div class="drow info"><span>封包</span><b>好 ${st.packetsGood} / 壞 ${st.packetsBad}` +
     `（遺失 ${((st.packetsBad / Math.max(1, st.packetsGood + st.packetsBad)) * 100).toFixed(1)}%）</b></div>` +
     `<div class="drow info"><span>通道</span><b>SNR ${st.snrDb?.toFixed(1) ?? '--'} dB，` +
-    `時脈 ${st.rhoPpm?.toFixed(0) ?? '--'} ppm</b></div>`;
+    `時脈 ${st.rhoPpm?.toFixed(0) ?? '--'} ppm　調變 ${st.detectedMod ?? '偵測中'}</b></div>` +
+    (st.snrDb !== null && st.snrDb < 11 && st.detectedMod === 'qpsk'
+      ? `<div class="drow warn"><span>建議</span><b>SNR 偏低，發送端改用 BPSK 會更快</b></div>` : '');
 }
 
 async function finishReceive() {

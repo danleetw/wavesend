@@ -96,7 +96,7 @@ h1 #ver { font-size: 13px; font-weight: 400; color: var(--muted); margin-left: 6
 
 </head>
 <body>
-<h1>wavesync <span id="ver">V26.0805 22:45</span></h1>
+<h1>wavesync <span id="ver">V26.0805 22:55</span></h1>
 <p class="sub">用聲音把檔案從一台裝置送到另一台。無網路、無配對、無伺服器。</p>
 
 <section class="card">
@@ -2508,6 +2508,7 @@ async function startSend() {
 
   const gainDb = Number(document.querySelector('input[name=txgain]:checked').value);
   state.txGain = Math.pow(10, gainDb / 20);
+  state.txGainDb = gainDb;
   if (gainDb !== 0) log(`輸出增益 ${gainDb} dB（降低驅動位準可減少喇叭的可聽互調失真）`);
 
   const gain = ctx.createGain();
@@ -2552,7 +2553,12 @@ function renderTx(tx) {
   const st = tx.stats();
   const secs = (performance.now() - state.t0) / 1000;
   const rate = secs > 0 ? st.bytesSent / secs : 0;
+  // 輸出增益直接顯示出來 —— 接收端 SNR 偏低時，第一個要確認的就是它，
+  // 而它是唯一「設定了但看不見」的東西。
   $('txProgress').innerHTML =
+    `<div class="drow ${state.txGainDb <= -12 ? 'warn' : 'info'}"><span>設定</span><b>` +
+    `${currentBand()} / ${currentMod()} / 輸出 ${state.txGainDb} dB` +
+    `${state.txGainDb <= -12 ? '（很低，接收端 SNR 會不足）' : ''}</b></div>` +
     `<div class="drow info"><span>已上線</span><b>${fmtBytes(st.bytesSent)}　` +
     `${rate.toFixed(0)} B/s　已跑 ${fmtSec(secs)}</b></div>` +
     (st.segCount > 1

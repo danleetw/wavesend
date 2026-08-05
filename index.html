@@ -102,7 +102,7 @@ h1 #ver { font-size: 13px; font-weight: 400; color: var(--muted); margin-left: 6
 
 </head>
 <body>
-<h1>wavesync <span id="ver">V26.0806 02:39</span></h1>
+<h1>wavesync <span id="ver">V26.0806 02:47</span></h1>
 <p class="sub">用聲音把檔案從一台裝置送到另一台。無網路、無配對、無伺服器。</p>
 
 <section class="card">
@@ -122,8 +122,8 @@ h1 #ver { font-size: 13px; font-weight: 400; color: var(--muted); margin-left: 6
 <section class="card">
   <h2>2. 模式</h2>
   <div class="radios">
-    <label><input type="radio" name="band" value="stealth" checked> Stealth 18–22 kHz（無聲）</label>
-    <label><input type="radio" name="band" value="turbo"> Turbo 2–22 kHz（很吵）</label>
+    <label><input type="radio" name="band" value="stealth" checked> Stealth 18–21.2 kHz（無聲）</label>
+    <label><input type="radio" name="band" value="turbo"> Turbo 2–21.2 kHz（很吵）</label>
   </div>
   <div class="radios" style="margin-top:10px">
     <span style="color:var(--muted);font-size:13px">調變</span>
@@ -133,8 +133,9 @@ h1 #ver { font-size: 13px; font-weight: 400; color: var(--muted); margin-left: 6
   </div>
   <div id="bandInfo" class="diag" style="margin-top:10px"></div>
   <p class="hint">兩端的<b>模式</b>必須一致；<b>調變</b>只有發送端要選，接收端會自己判斷。Stealth 幾乎沒人聽得見；Turbo 快 5 倍但聲音像數據機撥號。
-  BPSK 的門檻比 QPSK 低 4.8 dB。接收端顯示的 SNR 若低於 11 dB，就該改用 BPSK ——
-  QPSK 在那個位準下封包會大量壞掉（實測 8.2 dB 時遺失 83.6%），改 BPSK 反而更快。</p>
+  BPSK 的門檻比 QPSK 低 4.8 dB，但即使封包壞掉率到 25–40%，QPSK 因為每個符元多一倍
+  位元，整體仍然比較快 —— 噴泉碼本來就是拿來吸收遺失的。實機對測（貼合 2–3 cm）：
+  QPSK 約 180 B/s、BPSK 約 120 B/s。位置擺不好、SNR 掉到 8 dB 以下時才改用 BPSK。</p>
 </section>
 
 <section class="card">
@@ -158,7 +159,7 @@ h1 #ver { font-size: 13px; font-weight: 400; color: var(--muted); margin-left: 6
     <label><input type="radio" name="txgain" value="-18"> −18 dB</label>
   </div>
   <p class="hint">Stealth 模式若還是聽得到聲音，把這個調低。原因是喇叭的二階互調把
-  18–22 kHz 之間任兩個副載波的差頻生到 0–4 kHz —— 降低驅動位準能讓峰值離開非線性區，
+  18–21.2 kHz 之間任兩個副載波的差頻生到 0–3.2 kHz —— 降低驅動位準能讓峰值離開非線性區，
   每降 1 dB，互調降約 2 dB。訊號已做過削峰處理，降 6 dB 後接收端的 SNR 幾乎不變。</p>
   <p class="hint" id="fileInfo">尚未選擇檔案</p>
   <div class="btns">

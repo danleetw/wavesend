@@ -102,7 +102,7 @@ h1 #ver { font-size: 13px; font-weight: 400; color: var(--muted); margin-left: 6
 
 </head>
 <body>
-<h1>wavesync <span id="ver">V26.0807 00:56</span></h1>
+<h1>wavesync <span id="ver">V26.0807 01:00</span></h1>
 <p class="sub">用聲音把檔案從一台裝置送到另一台。無網路、無配對、無伺服器。</p>
 
 <section class="card">
@@ -3339,6 +3339,15 @@ const ACK_EVERY = 3;            // 每這麼多個聽窗回報一次（見 sendA
 // 7 秒 ≈ 4 個交握週期。反向鏈路正常時第一、二次就會回；不正常時這 7 秒
 // 是純粹的損失，所以不能設太長（原本 14 秒等於整場多花 28%）。
 const HELLO_WAIT_SEC = 7;
+// 上一次交握談成了嗎？沒談成就不要每次都再等滿 7 秒。
+//
+// 反向鏈路（手機喇叭 → 電腦麥克風）不通時，交握是穩定失敗的 —— 那 7 秒
+// 在一趟 35 秒的傳輸裡就是 20% 的純損失。記住結果，失敗過就只探 2.5 秒；
+// 只要有一次談成就恢復完整重試。這個記憶只存在於這個分頁，重新整理就重置，
+// 所以使用者調好位置之後不必找哪裡可以清掉它。
+const SHORT_PROBE_SEC = 2.5;
+let handshakeEverFailed = false;
+const helloWait = () => (handshakeEverFailed ? SHORT_PROBE_SEC : HELLO_WAIT_SEC);
 // 交握期間把排程前置量壓短，否則決定改用資料訊框時，
 // 已經排進去的 HELLO 還要播好幾秒
 const LOOKAHEAD_PROBE_SEC = 2.2;
@@ -3525,8 +3534,9 @@ async function startSend() {
     checkForAck(state.tx);
     // 交握試夠次數還是沒回應就自己開始 —— 對方可能根本沒開麥克風，
     // 或反向鏈路不通。那不該讓傳送完全動不了。
-    if (state.hsPhase === 'probing' && ctx.currentTime - state.hsStart > HELLO_WAIT_SEC) {
-      log(`⚠ 交握 ${HELLO_WAIT_SEC} 秒沒有回應（送了 ${state.helloTries} 次），` +
+    if (state.hsPhase === 'probing' && ctx.currentTime - state.hsStart > helloWait()) {
+      handshakeEverFailed = true;
+      log(`⚠ 交握 ${helloWait().toFixed(1)} 秒沒有回應（送了 ${state.helloTries} 次），` +
         `改用手動選的 ${currentMod()}，速率會保守很多。`);
       log('  回報走的是「手機喇叭 → 電腦麥克風」這個反方向。收不到通常是：' +
         '手機沒開始接收、手機媒體音量太小、或手機的喇叭那一端被壓住／朝向桌面。');
@@ -3620,6 +3630,7 @@ function applyReady(ready) {
     beginSending(currentMod(), ready.have);
     return;
   }
+  handshakeEverFailed = false;
   log(`↩ 交握成功：對方量到的通道可載 ${bits} bits/符元` +
     `（${used}/${table.length} 個副載波可用）` +
     `${ready.have.length ? `，已有 ${ready.have.length} 段可跳過` : ''}`);
@@ -3641,7 +3652,7 @@ function beginSending(modOrTable, preAcked) {
 }
 
 function renderHandshake(ctx) {
-  const left = Math.max(0, HELLO_WAIT_SEC - (ctx.currentTime - state.hsStart));
+  const left = Math.max(0, helloWait() - (ctx.currentTime - state.hsStart));
   $('txProgress').innerHTML =
     `<div class="drow info"><span>交握中</span><b>已送 ${state.helloTries} 次 HELLO，` +
     `等待接收端回報通道狀況（還有 ${left.toFixed(0)} 秒）</b></div>` +

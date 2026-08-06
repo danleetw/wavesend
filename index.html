@@ -102,7 +102,7 @@ h1 #ver { font-size: 13px; font-weight: 400; color: var(--muted); margin-left: 6
 
 </head>
 <body>
-<h1>wavesync <span id="ver">V26.0806 02:47</span></h1>
+<h1>wavesync <span id="ver">V26.0807 00:56</span></h1>
 <p class="sub">用聲音把檔案從一台裝置送到另一台。無網路、無配對、無伺服器。</p>
 
 <section class="card">
@@ -203,7 +203,7 @@ h1 #ver { font-size: 13px; font-weight: 400; color: var(--muted); margin-left: 6
 <script>
 (function () {
 'use strict';
-const WORKER_SRC = "// ═══ ../src/dsp/fft.js ═════════════════════════════════════════\n// 就地 radix-2 FFT，預先計算 twiddle 表以避免遞推累積誤差。\nclass FFT {\n  constructor(n) {\n    if ((n & (n - 1)) !== 0 || n < 2) throw new Error('FFT size must be a power of 2');\n    this.n = n;\n    this.cos = new Float64Array(n / 2);\n    this.sin = new Float64Array(n / 2);\n    for (let i = 0; i < n / 2; i++) {\n      const ang = (-2 * Math.PI * i) / n;\n      this.cos[i] = Math.cos(ang);\n      this.sin[i] = Math.sin(ang);\n    }\n    this.rev = new Uint32Array(n);\n    let bits = 0;\n    while (1 << bits < n) bits++;\n    for (let i = 0; i < n; i++) {\n      let r = 0;\n      for (let b = 0; b < bits; b++) if (i & (1 << b)) r |= 1 << (bits - 1 - b);\n      this.rev[i] = r;\n    }\n  }\n\n  forward(re, im) {\n    const { n, rev, cos, sin } = this;\n    for (let i = 0; i < n; i++) {\n      const j = rev[i];\n      if (i < j) {\n        let t = re[i]; re[i] = re[j]; re[j] = t;\n        t = im[i]; im[i] = im[j]; im[j] = t;\n      }\n    }\n    for (let len = 2; len <= n; len <<= 1) {\n      const half = len >> 1;\n      const step = n / len;\n      for (let i = 0; i < n; i += len) {\n        for (let k = 0, tw = 0; k < half; k++, tw += step) {\n          const wr = cos[tw], wi = sin[tw];\n          const a = i + k, b = a + half;\n          const vr = re[b] * wr - im[b] * wi;\n          const vi = re[b] * wi + im[b] * wr;\n          re[b] = re[a] - vr; im[b] = im[a] - vi;\n          re[a] += vr;        im[a] += vi;\n        }\n      }\n    }\n  }\n\n  // 共軛 → forward → 共軛 → 1/N\n  inverse(re, im) {\n    const { n } = this;\n    for (let i = 0; i < n; i++) im[i] = -im[i];\n    this.forward(re, im);\n    const s = 1 / n;\n    for (let i = 0; i < n; i++) { re[i] *= s; im[i] = -im[i] * s; }\n  }\n}\n\n// 以 FFT 做循環相關：回傳 |correlation| 的平方，長度 nfft。\n// 用於 chirp 前導的匹配濾波 —— 直接時域相關在 4096 tap 下太慢。\nfunction correlateMagSq(signal, offset, len, template, nfft) {\n  const fft = new FFT(nfft);\n  const ar = new Float64Array(nfft), ai = new Float64Array(nfft);\n  const br = new Float64Array(nfft), bi = new Float64Array(nfft);\n  for (let i = 0; i < len && offset + i < signal.length; i++) ar[i] = signal[offset + i];\n  for (let i = 0; i < template.length; i++) br[i] = template[i];\n  fft.forward(ar, ai);\n  fft.forward(br, bi);\n  // A · conj(B)\n  for (let k = 0; k < nfft; k++) {\n    const rr = ar[k] * br[k] + ai[k] * bi[k];\n    const ii = ai[k] * br[k] - ar[k] * bi[k];\n    ar[k] = rr; ai[k] = ii;\n  }\n  fft.inverse(ar, ai);\n  const out = new Float64Array(nfft);\n  for (let k = 0; k < nfft; k++) out[k] = ar[k] * ar[k] + ai[k] * ai[k];\n  return out;\n}\n\n// ═══ ../src/dsp/interp.js ══════════════════════════════════════\n// 小數位置的 sinc 插值。\n//\n// 收發時脈差的補償靠它，而我們的頻帶頂端 22 kHz 已達 0.917 Nyquist ——\n// 過渡帶只剩 2 kHz（0.042·fs）。窗函數選錯會直接在那裡崩掉：\n// 原本用 32-tap Blackman，在 offset=0.5 時 20 kHz 尚有 63 dB，\n// 22 kHz 卻只剩 16.7 dB，接收端一開啟小數取樣就把頻帶頂端毀掉。\n//\n// 改用 Kaiser(β=8) 並加長到 64 tap。經驗式 N ≈ A/(22·Δf/fs)：\n// 60 dB 阻帶配 0.042 的過渡帶約需 65 tap。\n\nconst TAPS = 64;\nconst INTERP_HALF = TAPS / 2;\nconst BETA = 8.0;\n\nfunction besselI0(x) {\n  let sum = 1, term = 1;\n  const h = (x * x) / 4;\n  for (let k = 1; k < 40; k++) {\n    term *= h / (k * k);\n    sum += term;\n    if (term < 1e-16 * sum) break;\n  }\n  return sum;\n}\n\n// 窗只跟 tap 序號有關，與小數位置無關，先算好\nconst WIN = new Float64Array(TAPS);\n{\n  const denom = besselI0(BETA);\n  for (let i = 0; i < TAPS; i++) {\n    const r = (2 * i) / (TAPS - 1) - 1;\n    WIN[i] = besselI0(BETA * Math.sqrt(Math.max(0, 1 - r * r))) / denom;\n  }\n}\n\nfunction sincAt(x, pos) {\n  const i0 = Math.floor(pos);\n  const frac = pos - i0;\n  let acc = 0;\n  for (let t = -INTERP_HALF + 1, w = 0; t <= INTERP_HALF; t++, w++) {\n    const idx = i0 + t;\n    if (idx < 0 || idx >= x.length) continue;\n    const d = t - frac;\n    const s = Math.abs(d) < 1e-9 ? 1 : Math.sin(Math.PI * d) / (Math.PI * d);\n    acc += x[idx] * s * WIN[w];\n  }\n  return acc;\n}\n\n// out[n] = x[n·ratio]，不引入額外延遲\nfunction resample(x, ratio) {\n  const outLen = Math.floor((x.length - INTERP_HALF) / ratio);\n  const out = new Float32Array(Math.max(0, outLen));\n  for (let n = 0; n < out.length; n++) out[n] = sincAt(x, n * ratio);\n  return out;\n}\n\n// ═══ ../src/dsp/prng.js ════════════════════════════════════════\n// 固定種子的 xorshift32。收發兩端必須產生完全相同的 pilot 與 probe 序列，\r\n// 所以不能用 Math.random —— 這裡要的是可重現，不是隨機。\r\n/**\r\n * 32-bit 整數雪崩混合（splitmix32 的 finalizer）。\r\n *\r\n * xorshift32 對「連續的小種子」極度不友善：seed=1 的第一個輸出只有 270305，\r\n * 除以 2³² 得 6.3e-5 —— 拿去查機率分布會一律落在最小的那一格。\r\n * 噴泉碼的封包序號正好就是 0,1,2,3…，不先打散的話所有封包都會拿到度數 1，\r\n * 整個噴泉碼退化成隨機挑塊（實測解碼開銷從 1.05×K 惡化到 3.8×K）。\r\n */\r\nfunction mix32(x) {\r\n  x = (x ^ (x >>> 16)) >>> 0;\r\n  x = Math.imul(x, 0x7feb352d) >>> 0;\r\n  x = (x ^ (x >>> 15)) >>> 0;\r\n  x = Math.imul(x, 0x846ca68b) >>> 0;\r\n  x = (x ^ (x >>> 16)) >>> 0;\r\n  return x >>> 0;\r\n}\r\n\r\nfunction xorshift32(seed) {\r\n  let s = seed >>> 0 || 0x9e3779b9;\r\n  return () => {\r\n    s ^= s << 13; s >>>= 0;\r\n    s ^= s >>> 17;\r\n    s ^= s << 5;  s >>>= 0;\r\n    return s;\r\n  };\r\n}\r\n\r\n// 產生 n 個 QPSK 符元（單位功率），供 probe 與 pilot 使用。\r\nfunction pskSequence(n, seed) {\r\n  const rnd = xorshift32(seed);\r\n  const re = new Float64Array(n);\r\n  const im = new Float64Array(n);\r\n  const a = Math.SQRT1_2;\r\n  for (let i = 0; i < n; i++) {\r\n    const v = rnd();\r\n    re[i] = (v & 1) ? a : -a;\r\n    im[i] = (v & 2) ? a : -a;\r\n  }\r\n  return { re, im };\r\n}\r\n\r\n// 高斯雜訊（Box-Muller）。模擬用，種子固定以便重現失敗案例。\r\nfunction gaussianSource(seed) {\r\n  const rnd = xorshift32(seed);\r\n  const u = () => (rnd() + 1) / 4294967297;\r\n  let spare = null;\r\n  return () => {\r\n    if (spare !== null) { const v = spare; spare = null; return v; }\r\n    const r = Math.sqrt(-2 * Math.log(u()));\r\n    const t = 2 * Math.PI * u();\r\n    spare = r * Math.sin(t);\r\n    return r * Math.cos(t);\r\n  };\r\n}\n\n// ═══ ../src/modem/plan.js ══════════════════════════════════════\n// OFDM 參數與副載波配置。所有數字都來自 Step 0 的實測結論。\r\n\r\nconst SR = 48000;\r\nconst N = 1024;          // FFT 大小 → 副載波間距 46.875 Hz\r\nconst CP = 128;          // cyclic prefix，2.67 ms\r\nconst SYM = N + CP;      // 1152 samples = 24 ms → 41.67 symbol/s\r\nconst BIN_HZ = SR / N;\r\n\r\n// Step 0 定案：stealth 砍成 18–22 kHz（真正無聲，且避開筆電 16–18 kHz 的線圈嘯叫）\r\n// 上限 21.2 kHz 而不是 22 kHz。\r\n//\r\n// 48 kHz 取樣路徑的抗混疊濾波器從 21.1 kHz 開始下降，而且兩端的喇叭與\r\n// 麥克風各自再疊一層。實測 PC→手機：21.0 kHz 還有 43 dB 對比，21.5 掉到 32，\r\n// 21.75 剩 23，22.0 只有 12.6 dB —— 隔兩小時再量，22 kHz 直接量不到訊號。\r\n//\r\n// 那幾個 bin 不是「比較差」，是每個符元都在丟隨機 bit。頻段頂端佔 13% 的\r\n// 副載波，BPSK 下就是 6.5% 的位元錯誤率 —— 每個封包必壞。實測封包遺失率\r\n// 94%，而平均 SNR 看起來還有 40 dB，完全看不出問題出在哪。\r\n// 少 20% 的頻寬換掉這件事非常划算。\r\nconst BANDS = {\r\n  turbo: { fLow: 2000, fHigh: 21200 },\r\n  stealth: { fLow: 18000, fHigh: 21200 },\r\n};\r\n\r\nconst PILOT_SPACING = 8;   // 每 8 個副載波插一個 pilot\r\nconst PROBE_SEED = 0x5741_5645;  // \"WAVE\"\r\nconst PILOT_SEED = 0x50494c54;   // \"PILT\"\r\n\r\n// Step 0 定案：兩個模式都封頂 64QAM。256QAM 在瓶頸方向只換到 +8~13%，\r\n// 不值得為它承擔 1–2 度的相位精度要求。\r\nconst MAX_BITS = 6;\r\nconst GAP_DB = 6;                 // BER 1e-6 並計入編碼增益的實務差距\r\nconst LADDER = [6, 4, 2, 1];      // 64QAM / 16QAM / QPSK / BPSK\r\n\r\nfunction bitsForSnr(snrDb, maxBits = MAX_BITS) {\r\n  if (!isFinite(snrDb)) return 0;\r\n  const eff = snrDb - GAP_DB;\r\n  if (eff <= 0) return 0;\r\n  const cap = Math.log2(1 + Math.pow(10, eff / 10));\r\n  for (const b of LADDER) if (b <= maxBits && cap >= b) return b;\r\n  return 0;\r\n}\r\n\r\n/**\r\n * 建立傳輸計畫。\r\n * @param {object} opts\r\n * @param {'turbo'|'stealth'} opts.band\r\n * @param {Map<number,number>|null} opts.snrByBin  每個 bin 的實測 SNR(dB)；null 表示全部用 fallbackBits\r\n * @param {number} opts.fallbackBits  沒有量測資料時的保守預設\r\n * @param {number} opts.maxBits\r\n */\r\nfunction makePlan({ band = 'turbo', snrByBin = null, fallbackBits = 2, maxBits = MAX_BITS } = {}) {\r\n  const spec = BANDS[band];\r\n  if (!spec) throw new Error(`unknown band: ${band}`);\r\n\r\n  const binLow = Math.max(1, Math.ceil(spec.fLow / BIN_HZ));\r\n  const binHigh = Math.min(N / 2 - 1, Math.floor(spec.fHigh / BIN_HZ));\r\n\r\n  const bins = [];\r\n  for (let k = binLow; k <= binHigh; k++) bins.push(k);\r\n\r\n  // pilot 均勻分佈；兩端各放一個，讓相位斜率的線性擬合不外插\r\n  const pilotSet = new Set();\r\n  for (let i = 0; i < bins.length; i += PILOT_SPACING) pilotSet.add(bins[i]);\r\n  pilotSet.add(bins[bins.length - 1]);\r\n\r\n  const pilotBins = bins.filter((k) => pilotSet.has(k));\r\n  const dataBins = [];\r\n  const bitsByBin = new Map();\r\n  let bitsPerSymbol = 0;\r\n\r\n  for (const k of bins) {\r\n    if (pilotSet.has(k)) continue;\r\n    const b = snrByBin ? bitsForSnr(snrByBin.get(k) ?? -Infinity, maxBits) : fallbackBits;\r\n    if (b <= 0) continue;\r\n    dataBins.push(k);\r\n    bitsByBin.set(k, b);\r\n    bitsPerSymbol += b;\r\n  }\r\n\r\n  return {\r\n    band, spec, binLow, binHigh,\r\n    bins, pilotBins, dataBins, bitsByBin,\r\n    bitsPerSymbol,\r\n    rawBps: (bitsPerSymbol * SR) / SYM,\r\n    symbolSec: SYM / SR,\r\n  };\r\n}\r\n\r\n// 把 Step 0 摘要那種「每 250 Hz 一個整數 dB」的曲線攤成逐 bin 的 SNR。\r\n// 線性內插即可 —— 我們只用它決定調變階數，不需要更精細。\r\nfunction snrCurveToBins(curve) {\r\n  const pts = [...curve].sort((a, b) => a[0] - b[0]);\r\n  const out = new Map();\r\n  for (let k = 1; k < N / 2; k++) {\r\n    const hz = k * BIN_HZ;\r\n    if (hz < pts[0][0] || hz > pts[pts.length - 1][0]) continue;\r\n    let i = 0;\r\n    while (i < pts.length - 2 && pts[i + 1][0] < hz) i++;\r\n    const [x0, y0] = pts[i], [x1, y1] = pts[i + 1];\r\n    out.set(k, x1 === x0 ? y0 : y0 + ((y1 - y0) * (hz - x0)) / (x1 - x0));\r\n  }\r\n  return out;\r\n}\n\n// ═══ ../src/modem/qam.js ═══════════════════════════════════════\n// Gray 編碼的方形 QAM：BPSK(1) / QPSK(2) / 16QAM(4) / 64QAM(6)。\n//\n// b 為偶數時 I、Q 各分 b/2 個位元，各自是 L=2^(b/2) 階的 Gray PAM。\n// 每個星座都正規化成單位平均功率，等化與 SNR 換算才有共同基準。\n\nconst cache = new Map();\n\nfunction grayToBinary(g) {\n  let b = g;\n  for (let s = 1; s < 32; s <<= 1) b ^= b >>> s;\n  return b;\n}\n\nfunction pamLevels(halfBits) {\n  const L = 1 << halfBits;\n  const lv = new Float64Array(L);\n  for (let g = 0; g < L; g++) lv[g] = 2 * grayToBinary(g) - (L - 1);\n  return lv;\n}\n\nfunction constellation(bits) {\n  if (cache.has(bits)) return cache.get(bits);\n  let c;\n  if (bits === 1) {\n    c = { bits, bpsk: true, levels: null, scale: 1, L: 2 };\n  } else {\n    if (bits % 2 !== 0) throw new Error(`unsupported bits/subcarrier: ${bits}`);\n    const half = bits / 2;\n    const L = 1 << half;\n    // E[|s|²] = 2·E[I²]，E[I²] = (L²−1)/3\n    c = { bits, bpsk: false, levels: pamLevels(half), scale: 1 / Math.sqrt((2 * (L * L - 1)) / 3), L, half };\n  }\n  cache.set(bits, c);\n  return c;\n}\n\n// 從 bit reader 取 b 個位元映射成一個複數符元\nfunction mapSymbol(readBits, bits) {\n  const c = constellation(bits);\n  if (c.bpsk) return [readBits(1) ? 1 : -1, 0];\n  const gi = readBits(c.half);\n  const gq = readBits(c.half);\n  return [c.levels[gi] * c.scale, c.levels[gq] * c.scale];\n}\n\n// 硬判決解映射，回傳 b 個位元（最高位在前，與 mapSymbol 對應）\nfunction demapSymbol(re, im, bits, writeBits) {\n  const c = constellation(bits);\n  if (c.bpsk) { writeBits(re > 0 ? 1 : 0, 1); return; }\n  writeBits(nearestGray(re / c.scale, c), c.half);\n  writeBits(nearestGray(im / c.scale, c), c.half);\n}\n\nfunction nearestGray(v, c) {\n  let best = 0, bd = Infinity;\n  for (let g = 0; g < c.L; g++) {\n    const d = Math.abs(v - c.levels[g]);\n    if (d < bd) { bd = d; best = g; }\n  }\n  return best;\n}\n\n// 位元讀寫器：以 MSB-first 打包進 Uint8Array\nfunction bitReader(bytes) {\n  let pos = 0;\n  return {\n    read(n) {\n      let v = 0;\n      for (let i = 0; i < n; i++) {\n        const byte = bytes[pos >> 3] ?? 0;\n        v = (v << 1) | ((byte >> (7 - (pos & 7))) & 1);\n        pos++;\n      }\n      return v;\n    },\n    get consumed() { return pos; },\n  };\n}\n\nfunction bitWriter(byteLen) {\n  const bytes = new Uint8Array(byteLen);\n  let pos = 0;\n  return {\n    write(v, n) {\n      for (let i = n - 1; i >= 0; i--) {\n        if ((v >> i) & 1) bytes[pos >> 3] |= 1 << (7 - (pos & 7));\n        pos++;\n      }\n    },\n    get bytes() { return bytes; },\n    get written() { return pos; },\n  };\n}\n\n// ═══ ../src/modem/frame.js ═════════════════════════════════════\n// 訊框結構與同步前導。\r\n//\r\n//   [ CHIRP 4096 ] [ GUARD 512 ] [ PROBE ×2 ] [ DATA ×D ]\r\n//\r\n// 用線性掃頻（chirp）而非 Schmidl-Cox 式的重複前導，理由是聲學通道：\r\n// chirp 的匹配濾波在多重路徑下仍給出銳利的峰，且處理增益 = BW×T\r\n// （stealth 模式 4 kHz × 85 ms ≈ 25 dB），在低 SNR 方向仍站得住。\r\nconst CHIRP_LEN = 4096;\r\nconst GUARD = 512;\r\n// 送 5 個 probe，接收端丟掉第一個只用後 4 個。\r\n// 第一個 probe 的前面是靜音，其餘的前面都是 probe —— ISI 條件不同。\r\n// 把它一起拿去平均，那個系統性差異會被雜訊估計器誤判成雜訊，\r\n// 回音越強誤判越大（實測 95 sample 的回音讓 SNR 憑空少報 8 dB）。\r\nconst PROBE_SYMS = 5;\r\nconst PROBE_SKIP = 1;\r\nconst PROBE_USED = PROBE_SYMS - PROBE_SKIP;\r\nconst PREAMBLE_LEN = CHIRP_LEN + GUARD;\r\n\r\n// Tukey 窗，避免掃頻起訖的方波邊緣灑出寬頻雜訊污染鄰近頻段\r\nfunction tukey(n, alpha = 0.15) {\r\n  const w = new Float64Array(n);\r\n  const edge = Math.floor((alpha * (n - 1)) / 2);\r\n  for (let i = 0; i < n; i++) {\r\n    if (i < edge) w[i] = 0.5 * (1 + Math.cos(Math.PI * (i / edge - 1)));\r\n    else if (i > n - 1 - edge) w[i] = 0.5 * (1 + Math.cos(Math.PI * ((n - 1 - i) / edge - 1)));\r\n    else w[i] = 1;\r\n  }\r\n  return w;\r\n}\r\n\r\nfunction makeChirp(fLow, fHigh, len = CHIRP_LEN, sr = SR) {\r\n  const w = tukey(len);\r\n  const out = new Float64Array(len);\r\n  const rate = (fHigh - fLow) / (len / sr);\r\n  for (let i = 0; i < len; i++) {\r\n    const t = i / sr;\r\n    out[i] = w[i] * Math.cos(2 * Math.PI * (fLow * t + 0.5 * rate * t * t));\r\n  }\r\n  return out;\r\n}\r\n\r\n// probe 各符元用同一組值：H 估計可平均降噪 10·log10(PROBE_SYMS) dB，\r\n// 且兩個符元在時域完全相同，日後要加二次同步確認很方便。\r\nfunction probeSequence(plan) {\r\n  return pskSequence(plan.bins.length, PROBE_SEED);\r\n}\r\n\r\nfunction pilotSequence(plan, symbolIndex) {\r\n  return pskSequence(plan.pilotBins.length, (PILOT_SEED + symbolIndex * 0x9e3779b9) >>> 0);\r\n}\r\n\r\n/**\r\n * 以匹配濾波找 chirp 起點。\r\n * @returns {{index:number, peak:number, ratio:number}} ratio 為峰值對背景中位數的比，\r\n *          低於 ~8 表示沒抓到，應視為同步失敗而非硬用一個錯誤位置。\r\n */\r\nfunction findPreamble(signal, chirp, searchFrom = 0, searchLen = signal.length) {\r\n  const len = Math.min(searchLen, signal.length - searchFrom);\r\n  if (len < chirp.length) return { index: -1, peak: 0, ratio: 0 };\r\n\r\n  let nfft = 1;\r\n  while (nfft < len + chirp.length) nfft <<= 1;\r\n  const corr = correlateMagSq(signal, searchFrom, len, chirp, nfft);\r\n\r\n  const valid = len - chirp.length + 1;\r\n  let best = 0, peak = -1;\r\n  for (let m = 0; m < valid; m++) if (corr[m] > peak) { peak = corr[m]; best = m; }\r\n\r\n  // 用中位數當背景，避免峰值本身把平均值拉高\r\n  const sample = [];\r\n  const stride = Math.max(1, Math.floor(valid / 2048));\r\n  for (let m = 0; m < valid; m += stride) sample.push(corr[m]);\r\n  sample.sort((a, b) => a - b);\r\n  const median = sample[sample.length >> 1] || 1e-30;\r\n\r\n  return { index: searchFrom + best, peak, ratio: Math.sqrt(peak / median) };\r\n}\r\n\r\n// 目標波峰因數。OFDM 原生的 PAPR 高達 18.7 dB（stealth），峰值把功放逼進\r\n// 非線性區，而平均功率卻很低。後果有兩個：\r\n//   1. 二階互調把頻帶內任兩個副載波的差頻生出來。stealth 是 18–22 kHz，\r\n//      差頻正好落在 0–4 kHz —— 最容易聽見的範圍。「超音波模式卻聽得到聲音」\r\n//      就是這樣來的（跟指向性喇叭的原理相同）。\r\n//   2. 帶內失真吃掉 SNR。Step 1b 量到原始頻譜 SNR 49 dB 但星座只有 19 dB，\r\n//      30 dB 的缺口就是這個。\r\n// 削到 11 dB：stealth 的 PAPR 18.7→12.6、turbo 25.1→11.2，\r\n// 同樣峰值下平均功率多 7~15 dB。搭配把輸出調低同樣的量，峰值就離開\r\n// 非線性區，二階互調降約 14 dB，而接收端的訊號強度不變。\r\nconst TARGET_PAPR_DB = 11;\r\nconst PAPR_ITERATIONS = 3;\r\n\r\n/**\r\n * 削峰 + 濾波，反覆數次。\r\n *\r\n * 單純削峰會把能量灑到頻帶外（對 stealth 來說就是灑進可聽範圍），\r\n * 所以每次削完都要濾回頻帶內；但濾波又會讓峰值部分長回來，故需迭代。\r\n * 代價是帶內失真（EVM），11 dB 目標下 stealth 約 −32 dB、turbo 約 −21 dB，\r\n * 都低於通道本身的雜訊（實測 19–22 dB）。\r\n */\r\nfunction clipAndFilter(re, im, fft, bins) {\r\n  let rms = 0;\r\n  for (let i = 0; i < N; i++) rms += re[i] * re[i];\r\n  rms = Math.sqrt(rms / N);\r\n  if (rms <= 0) return;\r\n  const limit = rms * Math.pow(10, TARGET_PAPR_DB / 20);\r\n\r\n  const inBand = new Uint8Array(N);\r\n  for (const k of bins) { inBand[k] = 1; inBand[N - k] = 1; }\r\n\r\n  for (let it = 0; it < PAPR_ITERATIONS; it++) {\r\n    let clipped = 0;\r\n    for (let i = 0; i < N; i++) {\r\n      if (re[i] > limit) { re[i] = limit; clipped++; }\r\n      else if (re[i] < -limit) { re[i] = -limit; clipped++; }\r\n    }\r\n    if (!clipped) break;\r\n\r\n    im.fill(0);\r\n    fft.forward(re, im);\r\n    for (let k = 0; k < N; k++) if (!inBand[k]) { re[k] = 0; im[k] = 0; }\r\n    fft.inverse(re, im);\r\n  }\r\n}\r\n\r\n// 符元邊緣的升餘弦過渡長度。\r\n//\r\n// 每個符元單獨看是完美帶限的（實測帶外 −158 dB），但把符元接起來時\r\n// 邊界不連續，那個階躍會灑出寬頻噪音 —— 實測連續串接時 2–4 kHz 只有\r\n// −59 dB，對 stealth 來說就是直接可聽的雜音。\r\n//\r\n// 解法是讓每個符元多帶一段循環後綴，兩端各做一次升餘弦漸變，\r\n// 相鄰符元重疊相加。漸變區會吃掉 CP 的前 WINDOW 個 sample\r\n// （接收端的 FFT 視窗本來就從 CP−16 開始，剩下的延遲擴散預算\r\n// 從 112 降到 88，仍高於實測需要的 63）。\r\nconst SYM_WINDOW = 24;\r\nconst RAMP = (() => {\r\n  const r = new Float64Array(SYM_WINDOW);\r\n  for (let i = 0; i < SYM_WINDOW; i++) r[i] = 0.5 - 0.5 * Math.cos((Math.PI * (i + 0.5)) / SYM_WINDOW);\r\n  return r;\r\n})();\r\n\r\n// 把一組複數副載波值做 Hermitian 對稱擴展後 IFFT，得到實數時域符元。\r\n// 回傳長度為 SYM + SYM_WINDOW：多出來的是循環後綴，供重疊相加用。\r\nfunction toTimeSymbol(fft, specRe, specIm, bins = null) {\r\n  const re = new Float64Array(N), im = new Float64Array(N);\r\n  for (let k = 1; k < N / 2; k++) {\r\n    re[k] = specRe[k]; im[k] = specIm[k];\r\n    re[N - k] = specRe[k]; im[N - k] = -specIm[k];\r\n  }\r\n  re[0] = 0; im[0] = 0;\r\n  re[N / 2] = 0; im[N / 2] = 0;\r\n  fft.inverse(re, im);\r\n\r\n  if (bins) clipAndFilter(re, im, fft, bins);\r\n\r\n  const out = new Float64Array(SYM + SYM_WINDOW);\r\n  for (let i = 0; i < CP; i++) out[i] = re[N - CP + i];\r\n  for (let i = 0; i < N; i++) out[CP + i] = re[i];\r\n  // 循環後綴：body 的開頭，接在最後面\r\n  for (let i = 0; i < SYM_WINDOW; i++) out[SYM + i] = re[i];\r\n  // 兩端各做一次升餘弦漸變\r\n  for (let i = 0; i < SYM_WINDOW; i++) {\r\n    out[i] *= RAMP[i];\r\n    out[SYM + SYM_WINDOW - 1 - i] *= RAMP[i];\r\n  }\r\n  return out;\r\n}\r\n\r\n/**\r\n * 認出「錄到的其實是 Step 0 的探測訊號」。\r\n *\r\n * Step 0 的多音是嚴格以 N 個 sample 為週期的循環播放，OFDM 訊框不是。\r\n * 兩支工具的頻帶選項長得很像，很容易在 PC 上開著 Step 0 就按了播放 ——\r\n * 那樣會錄到看似正常、實則完全解不開的訊號，而解調端只會報 BER 0.5，\r\n * 讓人往錯的方向查。這裡直接指出來。\r\n *\r\n * @returns {{isStep0:boolean, rho:number}} rho 接近 1 即為 Step 0 訊號\r\n */\r\nfunction detectStep0Signal(samples, offset = 0, len = 40000) {\r\n  const end = Math.min(offset + len, samples.length - N);\r\n  let num = 0, d1 = 0, d2 = 0;\r\n  for (let i = offset; i < end; i++) {\r\n    const a = samples[i], b = samples[i + N];\r\n    num += a * b; d1 += a * a; d2 += b * b;\r\n  }\r\n  const rho = d1 > 0 && d2 > 0 ? num / Math.sqrt(d1 * d2) : 0;\r\n  return { isStep0: rho > 0.8, rho };\r\n}\r\n\r\nfunction makeFFT() {\r\n  return new FFT(N);\r\n}\n\n// ═══ ../src/modem/tx.js ════════════════════════════════════════\n\nconst TARGET_PEAK = 0.9;\r\n\r\n/**\r\n * 把位元組調變成一段完整訊框。\r\n * @param {Uint8Array} payload\r\n * @param {object} plan  makePlan() 的輸出\r\n * @returns {{samples: Float32Array, symbols: number, capacityBytes: number}}\r\n */\r\nfunction modulate(payload, plan, opts = {}) {\r\n  const fft = makeFFT();\r\n  // 先白化再上調變 —— 病態酬載（例如 manifest 的補零）會讓 PAPR 爆掉，\r\n  // 被 PAPR 抑制削平之後那幾個符元必定解錯。詳見 scramble.js\r\n  payload = scramble(payload, new Uint8Array(payload.length));\r\n  const bitsPerSym = plan.bitsPerSymbol;\r\n  if (bitsPerSym <= 0) throw new Error('plan 沒有任何可用副載波');\r\n\r\n  const symbols = Math.ceil((payload.length * 8) / bitsPerSym);\r\n  const capacityBytes = Math.floor((symbols * bitsPerSym) / 8);\r\n\r\n  const probe = probeSequence(plan);\r\n  const specRe = new Float64Array(N);\r\n  const specIm = new Float64Array(N);\r\n\r\n  const ofdm = [];\r\n\r\n  // ── probe：全頻帶已知 QPSK，兩個符元完全相同\r\n  specRe.fill(0); specIm.fill(0);\r\n  plan.bins.forEach((k, i) => { specRe[k] = probe.re[i]; specIm[k] = probe.im[i]; });\r\n  const probeSym = toTimeSymbol(fft, specRe, specIm, plan.bins);\r\n  for (let i = 0; i < PROBE_SYMS; i++) ofdm.push(probeSym);\r\n\r\n  // ── data\r\n  const reader = bitReader(payload);\r\n  const read = reader.read.bind(reader);\r\n  for (let s = 0; s < symbols; s++) {\r\n    specRe.fill(0); specIm.fill(0);\r\n    const pilots = pilotSequence(plan, s);\r\n    plan.pilotBins.forEach((k, i) => { specRe[k] = pilots.re[i]; specIm[k] = pilots.im[i]; });\r\n    for (const k of plan.dataBins) {\r\n      const [re, im] = mapSymbol(read, plan.bitsByBin.get(k));\r\n      specRe[k] = re; specIm[k] = im;\r\n    }\r\n    ofdm.push(toTimeSymbol(fft, specRe, specIm, plan.bins));\r\n  }\r\n\r\n  // OFDM 的 PAPR 高，chirp 近乎定包絡。分開正規化到同一個峰值，\r\n  // 讓兩者都用滿動態範圍 —— chirp 因此帶著遠高於資料段的能量，\r\n  // 這對同步是好事（處理增益全給了最需要可靠的那一步）。\r\n  let peak = 0;\r\n  for (const sym of ofdm) for (const v of sym) { const a = Math.abs(v); if (a > peak) peak = a; }\r\n  const gain = peak > 0 ? TARGET_PEAK / peak : 0;\r\n\r\n  // ACK 走反向掃頻，兩者的匹配濾波幾乎不互相響應，不會彼此誤認\r\n  const chirp = opts.chirp ?? makeChirp(plan.spec.fLow, plan.spec.fHigh);\r\n  // 尾端多留 SYM_WINDOW 讓最後一個符元的漸變收乾淨\r\n  const total = PREAMBLE_LEN + ofdm.length * SYM + SYM_WINDOW;\r\n  const out = new Float32Array(total);\r\n\r\n  for (let i = 0; i < CHIRP_LEN; i++) out[i] = chirp[i] * TARGET_PEAK;\r\n  // 重疊相加：每個符元前進 SYM，但長度是 SYM+SYM_WINDOW，\r\n  // 所以相鄰符元的漸變區會互相補上，接縫處不再有階躍。\r\n  let p = PREAMBLE_LEN;\r\n  for (const sym of ofdm) {\r\n    for (let i = 0; i < sym.length; i++) out[p + i] += sym[i] * gain;\r\n    p += SYM;\r\n  }\r\n\r\n  return { samples: out, symbols, capacityBytes, ofdmGain: gain };\r\n}\n\n// ═══ ../src/modem/scramble.js ══════════════════════════════════\n// 位元組擾亂器（scrambler）。\n//\n// 為什麼需要它：OFDM 把一整個符元的位元同時攤在所有副載波上，所以「資料\n// 長什麼樣」會直接決定時域波形的峰均比。全零的酬載在 BPSK 下讓每個副載波\n// 都拿到同一個星座點，相位一致 —— 時域上就是一根脈衝。\n//\n// 實測：manifest 封包有 65/92 個位元組是補零，它那 10 個符元的 PAPR 衝到\n// 16.6 dB，其他符元只有 11 dB。而 PAPR 抑制的目標就是 11 dB，於是那幾個\n// 符元被削平、CRC 必定失敗。症狀很難看懂 —— 17 個訊框只有 3 個認得出\n// manifest，129 個資料封包因為沒有 manifest 可歸屬而整批丟掉，\n// 但「封包遺失率」看起來只有 20%。\n//\n// 解法就是 802.11 / DVB 都在用的那一招：傳送前把位元組流和一段固定的\n// 虛擬亂數序列 XOR，收下來再 XOR 回去。資料被白化之後就不會有病態圖樣。\n// 這一層放在 modem 內部，所以資料訊框與 ACK 訊框自動都受保護。\n\nconst TABLE_BYTES = 8192;        // 遠大於任何一個訊框，循環痕跡不會落在符元邊界上\n\nconst TABLE = (() => {\n  const t = new Uint8Array(TABLE_BYTES);\n  const r = xorshift32(mix32(0x57415645));   // 'WAVE'\n  for (let i = 0; i < TABLE_BYTES; i++) t[i] = r() & 0xff;\n  return t;\n})();\n\n/**\n * 就地擾亂／解擾亂（XOR 是自反的，同一個函式兩用）。\n * @param {Uint8Array} bytes\n * @param {Uint8Array} [out] 給定時不改動輸入\n */\nfunction scramble(bytes, out = bytes) {\n  for (let i = 0; i < bytes.length; i++) out[i] = bytes[i] ^ TABLE[i % TABLE_BYTES];\n  return out;\n}\n\n// ═══ ../src/modem/rx.js ════════════════════════════════════════\n\n// FFT 視窗比 CP 結尾提早這麼多開始。CP 的 128 個 sample 是一份要分配的預算：\r\n// 一部分給前導的定時誤差，剩下的才是能容忍的通道延遲擴散。\r\n//\r\n// chirp 匹配濾波的定時解析度約為 1/BW —— turbo 頻寬 20 kHz 時只有 2.4 個\r\n// sample，stealth 的 4 kHz 也才 12 個。原本取 32 過度保守，把延遲擴散預算\r\n// 壓到 96 samples；實測 95 sample 的回音就會踩線產生 ISI，而且劣化隨頻率\r\n// 遞增（20 kHz 處掉 12 dB）。改成 16 後預算為 112 samples ≈ 2.3 ms，\r\n// 對應 80 cm 的路徑差。\r\nconst WINDOW_ADVANCE = 16;\r\nconst MIN_SYNC_RATIO = 8;\r\n\r\n// 實體時脈差的上限。消費級音訊晶振通常在 ±50 ppm 內，兩台裝置相加也不會\r\n// 超過幾百 ppm。低 SNR 時漂移估計是純噪音，不設限就會算出離譜的 step\r\n// 去重讀 probe，整條解調鏈當場崩掉（實測 BPSK 4 dB 時 SNR 掉到 −24 dB）。\r\nconst MAX_PPM = 1000;\r\nconst clampRho = (r) => Math.max(-MAX_PPM / 1e6, Math.min(MAX_PPM / 1e6, r || 0));\r\n\r\n// step 為 1 時走整數索引的快路；只有需要補償時脈差時才付插值的代價。\r\nfunction fftAt(fft, samples, start, re, im, step = 1) {\r\n  if (step === 1 && Number.isInteger(start)) {\r\n    for (let i = 0; i < N; i++) {\r\n      const idx = start + i;\r\n      re[i] = idx >= 0 && idx < samples.length ? samples[idx] : 0;\r\n      im[i] = 0;\r\n    }\r\n  } else {\r\n    for (let i = 0; i < N; i++) {\r\n      const pos = start + i * step;\r\n      re[i] = pos >= 0 && pos < samples.length - 1 ? sincAt(samples, pos) : 0;\r\n      im[i] = 0;\r\n    }\r\n  }\r\n  fft.forward(re, im);\r\n}\r\n\r\n// 5-tap 二項式平滑。殘餘相位在頻率上是一條直線，而對稱濾波器作用在\r\n// 線性相位斜坡上只會等比縮小振幅、完全不動相位，所以這個平滑不引入偏差，\r\n// 只換來約 5.6 dB 的噪音抑制。\r\nconst SMOOTH = [1, 4, 6, 4, 1];\r\nconst SMOOTH_SUM = 16;\r\n\r\n/**\r\n * 由 pilot 殘餘估出「每個 bin 各自的」相位校正量。\r\n *\r\n * 不用全域線性擬合 —— 那會把斜率的估計誤差外推到頻帶兩端放大兩百倍以上，\r\n * 低 SNR 時整個星座直接被轉爛（實測 BPSK 4 dB、QPSK 7 dB 全毀，\r\n * 而同時 16/64QAM 因為配的 SNR 高所以看起來正常，差點誤導成「低階調變有問題」）。\r\n * 改成只在相鄰 pilot 之間內插：每個資料副載波的校正只來自它左右兩個 pilot，\r\n * 噪音不會被外推。\r\n *\r\n * @returns {{corrRe:Float64Array, corrIm:Float64Array, tau:number}}\r\n *          corr 為單位長度的共軛校正子；tau 僅供視窗追蹤的慢速回饋使用。\r\n */\r\nfunction pilotCorrection(zRe, zIm, plan, pilots, out) {\r\n  const bins = plan.pilotBins;\r\n  const n = bins.length;\r\n  const { rawRe, rawIm, smRe, smIm, corrRe, corrIm } = out;\r\n\r\n  for (let i = 0; i < n; i++) {\r\n    const k = bins[i];\r\n    const pr = pilots.re[i], pi = pilots.im[i];\r\n    rawRe[i] = zRe[k] * pr + zIm[k] * pi;\r\n    rawIm[i] = zIm[k] * pr - zRe[k] * pi;\r\n  }\r\n\r\n  for (let i = 0; i < n; i++) {\r\n    let ar = 0, ai = 0;\r\n    for (let t = -2; t <= 2; t++) {\r\n      let j = i + t;\r\n      if (j < 0) j = -j;                    // 邊界反射\r\n      if (j >= n) j = 2 * (n - 1) - j;\r\n      const w = SMOOTH[t + 2];\r\n      ar += rawRe[j] * w; ai += rawIm[j] * w;\r\n    }\r\n    smRe[i] = ar / SMOOTH_SUM; smIm[i] = ai / SMOOTH_SUM;\r\n  }\r\n\r\n  // 相鄰 pilot 之間做正規化線性內插（nlerp）。相位差在 ±π 內時，\r\n  // 弦與弧的差異只影響振幅，我們只取相位，所以無妨。\r\n  for (let i = 0; i < n - 1; i++) {\r\n    const k0 = bins[i], k1 = bins[i + 1];\r\n    const span = k1 - k0;\r\n    for (let k = k0; k < k1; k++) {\r\n      const t = (k - k0) / span;\r\n      const ar = smRe[i] * (1 - t) + smRe[i + 1] * t;\r\n      const ai = smIm[i] * (1 - t) + smIm[i + 1] * t;\r\n      const m = Math.hypot(ar, ai) || 1;\r\n      corrRe[k] = ar / m; corrIm[k] = -ai / m;   // 共軛 → 用乘的就能抵銷\r\n    }\r\n  }\r\n  {\r\n    const k = bins[n - 1];\r\n    const m = Math.hypot(smRe[n - 1], smIm[n - 1]) || 1;\r\n    corrRe[k] = smRe[n - 1] / m; corrIm[k] = -smIm[n - 1] / m;\r\n  }\r\n\r\n  // 視窗追蹤要的 τ：整個頻帶的平均相位斜率。這裡外推誤差無所謂，\r\n  // 因為它只餵進一個慢速的整數視窗回饋，還會再經過時間上的平滑。\r\n  //\r\n  // 符號：視窗晚 τ 個 sample 時取到的是 x[n+τ]，而 DFT{x[n+τ]}[k]\r\n  // = X[k]·e^{+j2πkτ/N}，所以斜率為正 → τ = slope·N/2π。\r\n  let dr = 0, di = 0;\r\n  for (let i = 1; i < n; i++) {\r\n    if (bins[i] - bins[i - 1] !== PILOT_SPACING) continue;\r\n    dr += smRe[i] * smRe[i - 1] + smIm[i] * smIm[i - 1];\r\n    di += smIm[i] * smRe[i - 1] - smRe[i] * smIm[i - 1];\r\n  }\r\n  const slope = dr === 0 && di === 0 ? 0 : Math.atan2(di, dr) / PILOT_SPACING;\r\n\r\n  // 相干度：複數和的長度 ÷ 各項長度之和。1 代表所有相鄰 pilot 對給出一致的\r\n  // 相位差（鎖定），趨近 0 代表 τ 估計已是純噪音。低 SNR 時若不看這個就\r\n  // 硬更新迴路，積分項會隨機漫步跑掉（實測 BPSK 4 dB 直接失鎖）。\r\n  let magSum = 0;\r\n  for (let i = 1; i < n; i++) {\r\n    if (bins[i] - bins[i - 1] !== PILOT_SPACING) continue;\r\n    magSum += Math.hypot(smRe[i], smIm[i]) * Math.hypot(smRe[i - 1], smIm[i - 1]);\r\n  }\r\n  const coherence = magSum > 0 ? Math.hypot(dr, di) / magSum : 0;\r\n\r\n  // 未經校正的噪音估計。不能拿「校正後的 pilot」量 —— 校正量就是從這些\r\n  // pilot 自己算出來的，會把自身噪音抵掉一部分，SNR 被高估。\r\n  // 用 raw 對 smooth 的殘差，再除以平滑器的方差係數 (1−2w₀+Σw²) 還原。\r\n  let nAcc = 0, nCnt = 0;\r\n  for (let i = 0; i < n; i++) {\r\n    const dr2 = rawRe[i] - smRe[i], di2 = rawIm[i] - smIm[i];\r\n    nAcc += dr2 * dr2 + di2 * di2; nCnt++;\r\n  }\r\n  const RESID_FACTOR = 1 - (2 * SMOOTH[2]) / SMOOTH_SUM +\r\n    SMOOTH.reduce((a, v) => a + v * v, 0) / (SMOOTH_SUM * SMOOTH_SUM);\r\n\r\n  return { tau: (slope * N) / (2 * Math.PI), coherence, noiseVar: nCnt ? nAcc / nCnt / RESID_FACTOR : Infinity };\r\n}\r\n\r\n// 各 probe 符元相對第一個的定時差，以及由其斜率推得的時脈差。\r\nfunction estimateProbeDrift(hsRe, hsIm, bins) {\r\n  const dtau = new Float64Array(hsRe.length);\r\n  for (let s = 1; s < hsRe.length; s++) {\r\n    let dr = 0, di = 0;\r\n    for (let i = 1; i < bins.length; i++) {\r\n      if (bins[i] - bins[i - 1] !== 1) continue;\r\n      const k = bins[i], j = bins[i - 1];\r\n      // (H_s[k]·conj(H_0[k])) · conj(H_s[j]·conj(H_0[j]))\r\n      const ar = hsRe[s][k] * hsRe[0][k] + hsIm[s][k] * hsIm[0][k];\r\n      const ai = hsIm[s][k] * hsRe[0][k] - hsRe[s][k] * hsIm[0][k];\r\n      const br = hsRe[s][j] * hsRe[0][j] + hsIm[s][j] * hsIm[0][j];\r\n      const bi = hsIm[s][j] * hsRe[0][j] - hsRe[s][j] * hsIm[0][j];\r\n      dr += ar * br + ai * bi;\r\n      di += ai * br - ar * bi;\r\n    }\r\n    dtau[s] = dr === 0 && di === 0 ? 0 : (Math.atan2(di, dr) * N) / (2 * Math.PI);\r\n  }\r\n  // 用擬合出來的直線取代個別估計值。漂移對符元序號本來就是線性的，\r\n  // 而每個 dtau[s] 的估計噪音在去旋轉時會被乘上 2πk/N 放大到高頻 ——\r\n  // 直接拿個別值去旋轉，等於把噪音注進通道估計，逐 bin SNR 因此少報約 2 dB。\r\n  let sxy = 0, sxx = 0;\r\n  const mean = (dtau.length - 1) / 2;\r\n  let dm = 0;\r\n  for (let s = 0; s < dtau.length; s++) dm += dtau[s];\r\n  dm /= dtau.length;\r\n  for (let s = 0; s < dtau.length; s++) { sxy += (s - mean) * (dtau[s] - dm); sxx += (s - mean) ** 2; }\r\n  const perSym = sxx > 0 ? sxy / sxx : 0;\r\n\r\n  // 斜率往 0 收縮，收多少由「它跟自己的估計誤差比起來有多強」決定。\r\n  //\r\n  // 只有 4 個 probe 可以擬合，低 SNR 時斜率幾乎全是雜訊 —— 但迴路照單全收，\r\n  // 把 rho 推到極端值，星座整個轉掉。實測 8 dB 時接收端自估 SNR 從 8 掉到\r\n  // −12 dB，BER 比理論差 3.4 dB；而純粹把 rho 夾小雖然治好了低 SNR，\r\n  // 卻讓真的有 500 ppm 時追不上去。\r\n  //\r\n  // 這裡用 Wiener 收縮：w = b²/(b²+se²)。斜率遠大於其標準誤時 w→1，\r\n  // 高 SNR 與大偏移的情況完全不受影響；斜率和雜訊同量級時 w→0，\r\n  // 自動退化成「不追蹤」，而不是被雜訊牽著走。\r\n  let ss = 0;\r\n  for (let s = 0; s < dtau.length; s++) ss += (dtau[s] - (dm + (s - mean) * perSym)) ** 2;\r\n  const dof = Math.max(1, dtau.length - 2);\r\n  const se2 = sxx > 0 ? ss / dof / sxx : Infinity;\r\n  const w = perSym * perSym / (perSym * perSym + se2);\r\n  const slope = perSym * (Number.isFinite(w) ? w : 0);\r\n\r\n  const fit = new Float64Array(dtau.length);\r\n  for (let s = 0; s < dtau.length; s++) fit[s] = dm + (s - mean) * slope;\r\n\r\n  return { dtau: fit, rho: slope / SYM };\r\n}\r\n\r\nfunction smoothReal(src, bins) {\r\n  const n = bins.length;\r\n  const out = new Float64Array(src.length);\r\n  for (let i = 0; i < n; i++) {\r\n    let a = 0;\r\n    for (let t = -2; t <= 2; t++) {\r\n      let j = i + t;\r\n      if (j < 0) j = -j;\r\n      if (j >= n) j = 2 * (n - 1) - j;\r\n      a += src[bins[j]] * SMOOTH[t + 2];\r\n    }\r\n    out[bins[i]] = a / SMOOTH_SUM;\r\n  }\r\n  return out;\r\n}\r\n\r\n/**\r\n * 沿頻率方向平滑通道估計。\r\n *\r\n * 直接用 probe 平均出來的 H 噪音只比資料低 10·log10(PROBE_SYMS) dB，\r\n * 等化時又把它注回訊號，實測在 64QAM 吃掉約 1.8 dB。通道的延遲擴散遠小於\r\n * FFT 長度，H 在頻率上本來就平滑，所以可以再濾一次。\r\n *\r\n * 但不能直接濾：視窗刻意提早 WINDOW_ADVANCE 開始，加上前導的殘餘定時誤差，\r\n * 讓 H 帶著明顯的線性相位斜坡（每 bin 約 0.2 rad）。對稱濾波器碰到斜坡會\r\n * 保相位但縮振幅，造成約 7% 的增益偏差。所以先估出整體斜率、去旋轉、\r\n * 平滑、再轉回來。\r\n */\r\nfunction smoothChannel(hRe, hIm, bins) {\r\n  const n = bins.length;\r\n  if (n < 5) return;\r\n\r\n  let dr = 0, di = 0;\r\n  for (let i = 1; i < n; i++) {\r\n    if (bins[i] - bins[i - 1] !== 1) continue;\r\n    const a = i, b = i - 1;\r\n    dr += hRe[bins[a]] * hRe[bins[b]] + hIm[bins[a]] * hIm[bins[b]];\r\n    di += hIm[bins[a]] * hRe[bins[b]] - hRe[bins[a]] * hIm[bins[b]];\r\n  }\r\n  const slope = dr === 0 && di === 0 ? 0 : Math.atan2(di, dr);\r\n\r\n  const dRe = new Float64Array(n), dIm = new Float64Array(n);\r\n  for (let i = 0; i < n; i++) {\r\n    const k = bins[i];\r\n    const a = -slope * k;\r\n    const c = Math.cos(a), s = Math.sin(a);\r\n    dRe[i] = hRe[k] * c - hIm[k] * s;\r\n    dIm[i] = hRe[k] * s + hIm[k] * c;\r\n  }\r\n\r\n  const oRe = new Float64Array(n), oIm = new Float64Array(n);\r\n  for (let i = 0; i < n; i++) {\r\n    let ar = 0, ai = 0;\r\n    for (let t = -2; t <= 2; t++) {\r\n      let j = i + t;\r\n      if (j < 0) j = -j;\r\n      if (j >= n) j = 2 * (n - 1) - j;\r\n      const w = SMOOTH[t + 2];\r\n      ar += dRe[j] * w; ai += dIm[j] * w;\r\n    }\r\n    oRe[i] = ar / SMOOTH_SUM; oIm[i] = ai / SMOOTH_SUM;\r\n  }\r\n\r\n  for (let i = 0; i < n; i++) {\r\n    const k = bins[i];\r\n    const a = slope * k;\r\n    const c = Math.cos(a), s = Math.sin(a);\r\n    hRe[k] = oRe[i] * c - oIm[i] * s;\r\n    hIm[k] = oRe[i] * s + oIm[i] * c;\r\n  }\r\n}\r\n\r\n/**\r\n * 解調一段訊框。\r\n * @param {Float32Array} samples\r\n * @param {object} plan\r\n * @param {{symbols:number, payloadBytes?:number}} opts\r\n */\r\nfunction demodulate(samples, plan, opts) {\r\n  const { symbols } = opts;\r\n  if (!symbols) throw new Error('需要 opts.symbols');\r\n  // 短訊框不做時脈追蹤。\r\n  //\r\n  // ACK 只有 4 個資料符元（96 ms）—— 就算兩端石英差 100 ppm，整段也只漂\r\n  // 0.46 個 sample，完全不需要補償。但迴路不知道訊框有多短，它照樣從\r\n  // 雜訊裡估時脈，實測被推到 ±1000 ppm 的上限（真值是個位數），\r\n  // 星座整個轉掉、CRC 必定不過。訊框短到不值得追蹤時就別追。\r\n  const trackClock = opts.trackClock ?? symbols >= 16;\r\n\r\n  const fft = makeFFT();\r\n  const chirp = opts.chirp ?? makeChirp(plan.spec.fLow, plan.spec.fHigh);\r\n  const sync = findPreamble(samples, chirp);\r\n  if (sync.index < 0 || sync.ratio < MIN_SYNC_RATIO) {\r\n    return { ok: false, reason: `同步失敗（ratio ${sync.ratio.toFixed(1)} < ${MIN_SYNC_RATIO}）`, sync };\r\n  }\r\n\r\n  const base = sync.index + PREAMBLE_LEN;\r\n  const re = new Float64Array(N), im = new Float64Array(N);\r\n\r\n  // ── 通道估計。前導的定時誤差在這裡被吸收進 H（表現為固定相位斜率），\r\n  //    因此後續只需追蹤「飄移」，不需要絕對定時精度。\r\n  //\r\n  //    但不能直接把幾個 probe 符元加起來平均：時脈差會讓它們彼此錯開，\r\n  //    500 ppm 下 4 個符元跨度就差 2.3 個 sample，在 k=469 相位差 6.6 rad，\r\n  //    盲目相加等於自我抵銷，高頻段的 H 會被抹平。\r\n  //    所以先量出每個 probe 相對第一個的定時差、去旋轉、再平均，\r\n  //    順便從這個差值的斜率取得時脈差的初值餵給後面的 PI 迴路。\r\n  const probe = probeSequence(plan);\r\n  const bins = plan.bins;\r\n  let hsRe = [], hsIm = [];\r\n\r\n  // 兩趟：第一趟用 step=1 粗估時脈差，第二趟帶著它重讀。\r\n  // 單趟不夠 —— 500 ppm 時單一 probe 符元內部就伸縮 0.5 個 sample，\r\n  // 這個 ICI 是 step 縮放才修得掉的，事後去旋轉補不回來。\r\n  let rho0 = 0;\r\n  for (let pass = 0; pass < 2; pass++) {\r\n    const step = 1 - rho0;\r\n    hsRe = []; hsIm = [];\r\n    for (let s = PROBE_SKIP; s < PROBE_SYMS; s++) {\r\n      const start = base + (s * SYM + CP - WINDOW_ADVANCE) * step;\r\n      fftAt(fft, samples, start, re, im, step);\r\n      const a = new Float64Array(N), b = new Float64Array(N);\r\n      bins.forEach((k, i) => {\r\n        const pr = probe.re[i], pi = probe.im[i];\r\n        a[k] = re[k] * pr + im[k] * pi;\r\n        b[k] = im[k] * pr - re[k] * pi;\r\n      });\r\n      hsRe.push(a); hsIm.push(b);\r\n    }\r\n    if (trackClock) rho0 = clampRho(rho0 + estimateProbeDrift(hsRe, hsIm, bins).rho);\r\n  }\r\n\r\n  const { dtau } = estimateProbeDrift(hsRe, hsIm, bins);\r\n\r\n  // 去旋轉後平均，同時用「各 probe 之間的離散程度」量出逐 bin 的雜訊 ——\r\n  // 這就是自適應 bit-loading 需要的東西，不必再另外送一次探測序列。\r\n  const hRe = new Float64Array(N), hIm = new Float64Array(N);\r\n  const alignRe = [], alignIm = [];\r\n  for (let s = 0; s < PROBE_USED; s++) {\r\n    const a = new Float64Array(N), b = new Float64Array(N);\r\n    for (const k of bins) {\r\n      const ang = (-2 * Math.PI * k * dtau[s]) / N;\r\n      const c = Math.cos(ang), sn = Math.sin(ang);\r\n      a[k] = hsRe[s][k] * c - hsIm[s][k] * sn;\r\n      b[k] = hsRe[s][k] * sn + hsIm[s][k] * c;\r\n      hRe[k] += a[k]; hIm[k] += b[k];\r\n    }\r\n    alignRe.push(a); alignIm.push(b);\r\n  }\r\n  for (const k of bins) { hRe[k] /= PROBE_USED; hIm[k] /= PROBE_USED; }\r\n\r\n  const rawNoise = new Float64Array(N);\r\n  for (const k of bins) {\r\n    let v = 0;\r\n    for (let s = 0; s < PROBE_USED; s++) {\r\n      const dr = alignRe[s][k] - hRe[k], di = alignIm[s][k] - hIm[k];\r\n      v += dr * dr + di * di;\r\n    }\r\n    rawNoise[k] = v / (PROBE_USED - 1);\r\n  }\r\n  // 只有 PROBE_SYMS−1 個自由度，方差估計本身很吵；沿頻率平滑一次\r\n  const noiseByBin = smoothReal(rawNoise, bins);\r\n\r\n  smoothChannel(hRe, hIm, plan.bins);\r\n\r\n  const weight = new Float64Array(N);\r\n  // 逐副載波 SNR：訊號功率要扣掉平均本身殘留的雜訊 (var/PROBE_SYMS)\r\n  const snrByBin = new Map();\r\n  for (const k of plan.bins) {\r\n    weight[k] = hRe[k] * hRe[k] + hIm[k] * hIm[k];\r\n    const nv = noiseByBin[k];\r\n    const sig = Math.max(weight[k] - nv / PROBE_USED, 0);\r\n    snrByBin.set(k, nv > 0 ? 10 * Math.log10(sig / nv) : -Infinity);\r\n  }\r\n\r\n  // ── 資料符元\r\n  const totalBits = symbols * plan.bitsPerSymbol;\r\n  const w = bitWriter(Math.ceil(totalBits / 8));\r\n  const write = w.write.bind(w);\r\n\r\n  const zRe = new Float64Array(N), zIm = new Float64Array(N);\r\n  const nP = plan.pilotBins.length;\r\n  const scratch = {\r\n    rawRe: new Float64Array(nP), rawIm: new Float64Array(nP),\r\n    smRe: new Float64Array(nP), smIm: new Float64Array(nP),\r\n    corrRe: new Float64Array(N), corrIm: new Float64Array(N),\r\n  };\r\n\r\n  // 時脈追蹤走 PI 迴路：\r\n  //   posOffset（比例項）吸收當下的定時誤差\r\n  //   rho（積分項）估計收發時脈的相對差，用來縮放取樣間距\r\n  //\r\n  // 只做整數視窗位移是不夠的 —— 那只修正「定時」，修不了「頻率縮放」。\r\n  // 時脈差 δ 會讓副載波間距也縮放 δ，在 k=469 造成 0.09 bin 的偏移，\r\n  // ICI 約 −15 dB，200 ppm 時就足以讓 16QAM 的 BER 停在 5e-3 下不去。\r\n  // 視窗位置用「遞增」推進，不是每次從 base 乘上 step 重算。\r\n  // 後者會讓積分項的迴路增益隨符元序號線性成長（s=100 時增益變成 4 倍），\r\n  // 必然震盪發散 —— 實測 rho 直接跑到 3000 ppm。\r\n  //\r\n  // 誤差動態：e[s+1] = (1−KP)e[s] + SYM·δ − u[s]，u[s+1] = u[s] + KI·e[s]\r\n  // 特徵方程 z² − (2−KP)z + (1−KP+KI)，KP=0.2/KI=0.02 時根為 0.9±0.1j，\r\n  // |z| = 0.906 < 1，時間常數約 10 個符元。\r\n  // 可從 opts 覆寫，供離線掃參數用（tools/loop-sweep.mjs）\r\n  const KP = trackClock ? (opts.kp ?? 0.20) : 0;\r\n  const KI = trackClock ? (opts.ki ?? 0.02) : 0;\r\n  let rho = rho0;\r\n  let pos = base + (PROBE_SYMS * SYM + CP - WINDOW_ADVANCE) * (1 - rho);\r\n  let noiseAcc = 0, noiseCnt = 0;\r\n  let lastTau = 0;\r\n\r\n  for (let s = 0; s < symbols; s++) {\r\n    const step = 1 - rho;\r\n    fftAt(fft, samples, pos, re, im, step);\r\n\r\n    for (const k of plan.bins) {\r\n      const d = weight[k];\r\n      if (d < 1e-20) { zRe[k] = 0; zIm[k] = 0; continue; }\r\n      zRe[k] = (re[k] * hRe[k] + im[k] * hIm[k]) / d;\r\n      zIm[k] = (im[k] * hRe[k] - re[k] * hIm[k]) / d;\r\n    }\r\n\r\n    const pilots = pilotSequence(plan, s);\r\n    const est = pilotCorrection(zRe, zIm, plan, pilots, scratch);\r\n    lastTau = est.tau;\r\n    noiseAcc += est.noiseVar; noiseCnt++;\r\n\r\n    for (const k of plan.bins) {\r\n      const cr = scratch.corrRe[k], ci = scratch.corrIm[k];\r\n      const rr = zRe[k] * cr - zIm[k] * ci;\r\n      const ii = zRe[k] * ci + zIm[k] * cr;\r\n      zRe[k] = rr; zIm[k] = ii;\r\n    }\r\n\r\n    for (const k of plan.dataBins) {\r\n      demapSymbol(zRe[k], zIm[k], plan.bitsByBin.get(k), write);\r\n    }\r\n\r\n    // τ > 0 表示視窗取晚了 → 位置往前拉，同時把時脈估計往上修。\r\n    // 迴路增益乘上相干度：估計不可信時自動凍結，而不是被噪音牽著走。\r\n    const g = est.coherence;\r\n    pos -= KP * g * lastTau;\r\n    rho = clampRho(rho + (KI * g * lastTau) / SYM);\r\n    pos += SYM * (1 - rho);\r\n  }\r\n\r\n  // 星座為單位平均功率，所以 SNR 就是 1/噪音方差\r\n  const noiseVar = noiseCnt ? noiseAcc / noiseCnt : Infinity;\r\n  return {\r\n    ok: true,\r\n    bytes: scramble(w.bytes),   // 就地解擾亂；XOR 自反，同一張表兩用\r\n\r\n    sync,\r\n    noiseVar,\r\n    snrDb: noiseVar > 0 ? -10 * Math.log10(noiseVar) : Infinity,\r\n    driftSamples: lastTau,\r\n    rhoPpm: rho * 1e6,\r\n    residTau: lastTau,\r\n    snrByBin,\r\n  };\r\n}\n\n// ═══ ../src/dsp/sha256.js ══════════════════════════════════════\n// 純 JS SHA-256。\n//\n// 不用 crypto.subtle 是因為它是非同步的、而且與 Node 的介面不同；\n// 自己實作可讓瀏覽器、Node 測試、離線工具跑完全同一份程式碼，\n// 也讓打包後的單檔不依賴任何平台 API。\n\nconst K = new Uint32Array([\n  0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,\n  0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,\n  0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,\n  0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,\n  0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,\n  0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,\n  0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,\n  0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,\n]);\n\nconst rotr = (x, n) => ((x >>> n) | (x << (32 - n))) >>> 0;\n\nfunction sha256(bytes) {\n  const h = new Uint32Array([\n    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,\n  ]);\n\n  const bitLen = bytes.length * 8;\n  const padded = new Uint8Array((((bytes.length + 9) >> 6) + 1) << 6);\n  padded.set(bytes);\n  padded[bytes.length] = 0x80;\n  // 長度為 64-bit big-endian；JS 位元運算只有 32 bit，高位用除法取\n  const hi = Math.floor(bitLen / 0x100000000);\n  const view = new DataView(padded.buffer);\n  view.setUint32(padded.length - 8, hi, false);\n  view.setUint32(padded.length - 4, bitLen >>> 0, false);\n\n  const w = new Uint32Array(64);\n  for (let off = 0; off < padded.length; off += 64) {\n    for (let i = 0; i < 16; i++) w[i] = view.getUint32(off + i * 4, false);\n    for (let i = 16; i < 64; i++) {\n      const s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >>> 3);\n      const s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >>> 10);\n      w[i] = (w[i - 16] + s0 + w[i - 7] + s1) >>> 0;\n    }\n    let [a, b, c, d, e, f, g, hh] = h;\n    for (let i = 0; i < 64; i++) {\n      const S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);\n      const ch = (e & f) ^ (~e & g);\n      const t1 = (hh + S1 + ch + K[i] + w[i]) >>> 0;\n      const S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);\n      const maj = (a & b) ^ (a & c) ^ (b & c);\n      const t2 = (S0 + maj) >>> 0;\n      hh = g; g = f; f = e; e = (d + t1) >>> 0;\n      d = c; c = b; b = a; a = (t1 + t2) >>> 0;\n    }\n    h[0] = (h[0] + a) >>> 0; h[1] = (h[1] + b) >>> 0; h[2] = (h[2] + c) >>> 0; h[3] = (h[3] + d) >>> 0;\n    h[4] = (h[4] + e) >>> 0; h[5] = (h[5] + f) >>> 0; h[6] = (h[6] + g) >>> 0; h[7] = (h[7] + hh) >>> 0;\n  }\n\n  const out = new Uint8Array(32);\n  new DataView(out.buffer).setUint32(0, h[0], false);\n  for (let i = 0; i < 8; i++) new DataView(out.buffer).setUint32(i * 4, h[i], false);\n  return out;\n}\n\nconst hex = (b) => [...b].map((v) => v.toString(16).padStart(2, '0')).join('');\n\n// ═══ ../src/fountain/packet.js ═════════════════════════════════\n// 傳輸封包格式與 CRC。\n//\n// 架構決定：不另外做 FEC（LDPC 之類），改成「CRC 偵錯 → 丟棄壞封包 →\n// 交給噴泉碼補」。這把位元錯誤通道轉成抹除通道，而噴泉碼本來就是為抹除\n// 設計的。少一層編解碼、少一組參數要調，代價只是壞封包的頻寬白費。\n//\n//   封包 = [ seed:3 | payload:P | CRC-16:2 ]\n//\n// seed 決定這個封包混了哪幾塊（收發用同一個 PRNG 推導），所以不必帶索引清單。\n// seed = 0xFFFFFF 保留給 manifest。\n\nconst SEED_BYTES = 3;\nconst CRC_BYTES = 2;\nconst OVERHEAD = SEED_BYTES + CRC_BYTES;\nconst MANIFEST_SEED = 0xffffff;\n\n// CRC-16/CCITT-FALSE。查表版，位元組序處理一次算好。\nconst CRC_TABLE = (() => {\n  const t = new Uint16Array(256);\n  for (let i = 0; i < 256; i++) {\n    let c = i << 8;\n    for (let j = 0; j < 8; j++) c = (c & 0x8000) ? ((c << 1) ^ 0x1021) & 0xffff : (c << 1) & 0xffff;\n    t[i] = c;\n  }\n  return t;\n})();\n\nfunction crc16(bytes, from = 0, to = bytes.length) {\n  let c = 0xffff;\n  for (let i = from; i < to; i++) c = ((c << 8) & 0xffff) ^ CRC_TABLE[((c >> 8) ^ bytes[i]) & 0xff];\n  return c;\n}\n\nfunction packetSize(payloadSize) {\n  return payloadSize + OVERHEAD;\n}\n\nfunction writePacket(out, offset, seed, payload) {\n  out[offset] = (seed >> 16) & 0xff;\n  out[offset + 1] = (seed >> 8) & 0xff;\n  out[offset + 2] = seed & 0xff;\n  out.set(payload, offset + SEED_BYTES);\n  const end = offset + SEED_BYTES + payload.length;\n  const c = crc16(out, offset, end);\n  out[end] = (c >> 8) & 0xff;\n  out[end + 1] = c & 0xff;\n  return end + CRC_BYTES;\n}\n\n/**\n * @returns {{seed:number, payload:Uint8Array}|null} CRC 不符時回 null\n */\nfunction readPacket(buf, offset, payloadSize) {\n  const end = offset + SEED_BYTES + payloadSize;\n  if (end + CRC_BYTES > buf.length) return null;\n  const want = (buf[end] << 8) | buf[end + 1];\n  if (crc16(buf, offset, end) !== want) return null;\n  return {\n    seed: (buf[offset] << 16) | (buf[offset + 1] << 8) | buf[offset + 2],\n    payload: buf.subarray(offset + SEED_BYTES, end),\n  };\n}\n\n/**\n * 依照 plan 每符元能載多少 bit，決定封包要跨幾個符元。\n *\n * 太小則 5 bytes 的表頭佔比失控；太大則單一位元錯就報銷一大塊頻寬\n * （BER 3e-4 時，200 bytes 的封包有 38% 機率壞掉，60 bytes 只有 13%）。\n * 對齊到符元邊界，讓某個符元的突發錯誤只波及一個封包。\n */\nfunction choosePacketLayout(bitsPerSymbol, targetBytes = 96) {\n  const bytesPerSymbol = bitsPerSymbol / 8;\n  const symbols = Math.max(1, Math.round(targetBytes / bytesPerSymbol));\n  const totalBytes = Math.floor((symbols * bitsPerSymbol) / 8);\n  const payloadSize = totalBytes - OVERHEAD;\n  if (payloadSize < 8) {\n    // 每符元載得太少，加符元數直到裝得下有意義的內容\n    return choosePacketLayout(bitsPerSymbol, targetBytes * 2);\n  }\n  return { symbols, totalBytes, payloadSize, bitsUsed: totalBytes * 8 };\n}\n\n// ═══ ../src/transfer/ack.js ════════════════════════════════════\n// 反向鏈路的回報（ACK）。\r\n//\r\n// 兩台裝置距離只有 2–3 cm，不可能同時收發 —— 自己喇叭的輸出會直接蓋掉\r\n// 自己的麥克風。所以走半雙工：發送端每隔幾個訊框留一個「聽窗」，\r\n// 接收端在那個窗裡送回報。\r\n//\r\n// 回報訊號用「反向 chirp」（22→18 kHz）而不是資料訊框的正向 chirp：\r\n// 兩者的匹配濾波幾乎不互相響應，發送端不會把自己的回音誤認成 ACK，\r\n// 接收端也不會把發送端的訊框誤認成回報。\r\n//\r\n//   [ 反向 chirp | guard | probe ×5 | 資料符元 ×4 ]  ≈ 312 ms\r\n//\r\n// 內容刻意做小：只要讓發送端知道「哪些段還缺」就夠了。\r\n// 同一份內容送三遍，各自帶 CRC，收端先試各份、再對位元做多數決。\r\n//\r\n// 回報是單一的 CRC 區塊 —— 錯一個 bit 就整包作廢，這跟資料訊框很不一樣\r\n// （資料有噴泉碼，掉幾個封包無所謂）。而實機上回報的解調 SNR 只有 5 dB\r\n// 左右（離線是 37 dB），BPSK 在那個位準的 BER 約 1e-2，一份必錯。\r\n//\r\n// 三份的位元落在不同的副載波上（32 bytes = 256 bits 不是每符元 59 bits\r\n// 的整數倍），所以固定壞掉的 bin 不會打中同一個位元位置 —— 多數決能把\r\n// 1e-2 的位元錯誤壓到 3e-4 量級。代價是訊框 0.41 → 0.60 s，聽窗 1.2 s 裝得下。\r\n// 實測 3 送 3 收。\r\n// 三份而不是四份：16 個符元裝得下 118 bytes，四份要 128 塞不進去，\r\n// 而三份的多數決本來就沒有平手問題 —— 偶數份反而要多一條裁決規則。\r\nconst ACK_COPIES = 3;\r\nconst ACK_SYMBOLS = 16;\r\nconst ACK_BITS = 1;                    // BPSK：回報必須比資料更禁得起雜訊\r\nconst BITMAP_SEGMENTS = 128;           // 從 firstNeeded 起算，涵蓋這麼多段\r\nconst BITMAP_BYTES = BITMAP_SEGMENTS / 8;\r\n\r\n//   [ magic:2 \"AK\" | hash8:8 | flags:1 | firstNeeded:3 | bitmap:16 | crc:2 ] = 32 bytes\r\nconst ACK_MAGIC = 0x414b;\r\nconst ACK_PAYLOAD_BYTES = 2 + 8 + 1 + 3 + BITMAP_BYTES + 2;\r\n\r\nfunction ackPlan(band) {\r\n  return makePlan({ band, fallbackBits: ACK_BITS });\r\n}\r\n\r\nfunction ackFrameSamples(band) {\r\n  return PREAMBLE_LEN + (PROBE_SYMS + ACK_SYMBOLS) * SYM;\r\n}\r\n\r\n// 反向掃頻：makeChirp 的斜率由參數順序決定，把高低頻對調即得\r\nconst reverseChirp = (plan) => makeChirp(plan.spec.fHigh, plan.spec.fLow);\r\n\r\n/**\r\n * @param {{hash8:Uint8Array, done:boolean, needed:number[]}} s\r\n *        needed 為「還缺的段號」清單\r\n */\r\nfunction encodeAck({ hash8, done, needed }) {\r\n  const out = new Uint8Array(ACK_PAYLOAD_BYTES);\r\n  out[0] = (ACK_MAGIC >> 8) & 0xff; out[1] = ACK_MAGIC & 0xff;\r\n  out.set(hash8.subarray(0, 8), 2);\r\n  out[10] = done ? 1 : 0;\r\n  const first = needed.length ? Math.min(...needed) : 0;\r\n  out[11] = (first >> 16) & 0xff; out[12] = (first >> 8) & 0xff; out[13] = first & 0xff;\r\n  for (const seg of needed) {\r\n    const rel = seg - first;\r\n    if (rel >= 0 && rel < BITMAP_SEGMENTS) out[14 + (rel >> 3)] |= 1 << (rel & 7);\r\n  }\r\n  const c = crc16(out, 0, ACK_PAYLOAD_BYTES - 2);\r\n  out[ACK_PAYLOAD_BYTES - 2] = (c >> 8) & 0xff;\r\n  out[ACK_PAYLOAD_BYTES - 1] = c & 0xff;\r\n  return out;\r\n}\r\n\r\nfunction decodeAck(buf) {\r\n  if (buf.length < ACK_PAYLOAD_BYTES) return null;\r\n  if (((buf[0] << 8) | buf[1]) !== ACK_MAGIC) return null;\r\n  const want = (buf[ACK_PAYLOAD_BYTES - 2] << 8) | buf[ACK_PAYLOAD_BYTES - 1];\r\n  if (crc16(buf, 0, ACK_PAYLOAD_BYTES - 2) !== want) return null;\r\n  const first = (buf[11] << 16) | (buf[12] << 8) | buf[13];\r\n  const needed = [];\r\n  for (let i = 0; i < BITMAP_SEGMENTS; i++) {\r\n    if (buf[14 + (i >> 3)] & (1 << (i & 7))) needed.push(first + i);\r\n  }\r\n  return { hash8: buf.slice(2, 10), done: buf[10] === 1, first, needed };\r\n}\r\n\r\n/** 產生一段回報音訊 */\r\nfunction modulateAck(band, payload) {\r\n  const plan = ackPlan(band);\r\n  const bytesPerFrame = Math.floor((ACK_SYMBOLS * plan.bitsPerSymbol) / 8);\r\n  const buf = new Uint8Array(bytesPerFrame);\r\n  for (let c = 0; c < ACK_COPIES; c++) {\r\n    const off = c * ACK_PAYLOAD_BYTES;\r\n    if (off + ACK_PAYLOAD_BYTES > bytesPerFrame) break;\r\n    buf.set(payload, off);\r\n  }\r\n  return modulate(buf, plan, { chirp: reverseChirp(plan) }).samples;\r\n}\r\n\r\n/**\r\n * 在一段錄音裡找回報訊號。\r\n * @returns {{ack:object, index:number, ratio:number}|null}\r\n */\r\nfunction findAck(samples, band, minRatio = 8) {\r\n  const plan = ackPlan(band);\r\n  const chirp = reverseChirp(plan);\r\n  const sync = findPreamble(samples, chirp);\r\n  if (sync.index < 0 || sync.ratio < minRatio) return null;\r\n\r\n  const need = ackFrameSamples(band);\r\n  if (samples.length - sync.index < need) return null;\r\n\r\n  let r;\r\n  try {\r\n    r = demodulate(samples.subarray(sync.index, sync.index + need), plan,\r\n      { symbols: ACK_SYMBOLS, chirp });\r\n  } catch { return null; }\r\n  if (!r.ok) return null;\r\n\r\n  const copies = [];\r\n  for (let c = 0; c < ACK_COPIES; c++) {\r\n    const off = c * ACK_PAYLOAD_BYTES;\r\n    if (off + ACK_PAYLOAD_BYTES > r.bytes.length) break;\r\n    const view = r.bytes.subarray(off, off + ACK_PAYLOAD_BYTES);\r\n    const ack = decodeAck(view);\r\n    if (ack) return { ack, index: sync.index, ratio: sync.ratio, copy: c };\r\n    copies.push(view);\r\n  }\r\n\r\n  // 每一份都沒過，就對位元做多數決再試一次。\r\n  // 錯的位元散在各份的不同位置，多數決能救回單份救不回來的情況。\r\n  if (copies.length < 3) return null;\r\n  const merged = new Uint8Array(ACK_PAYLOAD_BYTES);\r\n  for (let i = 0; i < ACK_PAYLOAD_BYTES; i++) {\r\n    let v = 0;\r\n    for (let b = 0; b < 8; b++) {\r\n      let ones = 0;\r\n      for (const c of copies) ones += (c[i] >> b) & 1;\r\n      if (ones * 2 > copies.length) v |= 1 << b;\r\n    }\r\n    merged[i] = v;\r\n  }\r\n  const ack = decodeAck(merged);\r\n  return ack ? { ack, index: sync.index, ratio: sync.ratio, copy: -1 } : null;\r\n}\nself.onmessage = (e) => {\n  const { buf, band, id } = e.data;\n  const x = new Float32Array(buf);\n  let got = null, ratio = 0, index = -1, why = null;\n  try {\n    // 順便回報「不管門檻」的相關峰值：找不到 ACK 時，這個數字能分辨\n    // 「緩衝裡根本沒有信標」和「信標在但內容解不開」——\n    // 兩者的下一步完全不同。\n    const plan = ackPlan(band);\n    const p = findPreamble(x, reverseChirp(plan));\n    ratio = p.ratio; index = p.index;\n    got = findAck(x, band);\n    // 相關峰明顯但解不出來時，把解調本身的結果帶回去 ——\n    // 「訊框不完整」「SNR 太低」「只是 CRC 沒過」要的處置完全不同。\n    if (!got && ratio > 40) {\n      const need = ackFrameSamples(band);\n      if (x.length - index < need) why = 'tail:' + (x.length - index) + '/' + need;\n      else {\n        const r = demodulate(x.subarray(index, index + need), plan,\n          { symbols: ACK_SYMBOLS, chirp: reverseChirp(plan) });\n        why = r.ok ? 'crc snr=' + r.snrDb.toFixed(1) + ' head=' + [...r.bytes.slice(0, 6)].join('.')\n          : 'demod-not-ok';\n      }\n    }\n  } catch { /* 訊框不完整就當作沒有 */ }\n  self.postMessage({ id, ratio, index, why, sec: x.length / 48000, found: got ? { ack: got.ack, ratio: got.ratio } : null });\n};\n";
+const WORKER_SRC = "// ═══ ../src/dsp/fft.js ═════════════════════════════════════════\n// 就地 radix-2 FFT，預先計算 twiddle 表以避免遞推累積誤差。\nclass FFT {\n  constructor(n) {\n    if ((n & (n - 1)) !== 0 || n < 2) throw new Error('FFT size must be a power of 2');\n    this.n = n;\n    this.cos = new Float64Array(n / 2);\n    this.sin = new Float64Array(n / 2);\n    for (let i = 0; i < n / 2; i++) {\n      const ang = (-2 * Math.PI * i) / n;\n      this.cos[i] = Math.cos(ang);\n      this.sin[i] = Math.sin(ang);\n    }\n    this.rev = new Uint32Array(n);\n    let bits = 0;\n    while (1 << bits < n) bits++;\n    for (let i = 0; i < n; i++) {\n      let r = 0;\n      for (let b = 0; b < bits; b++) if (i & (1 << b)) r |= 1 << (bits - 1 - b);\n      this.rev[i] = r;\n    }\n  }\n\n  forward(re, im) {\n    const { n, rev, cos, sin } = this;\n    for (let i = 0; i < n; i++) {\n      const j = rev[i];\n      if (i < j) {\n        let t = re[i]; re[i] = re[j]; re[j] = t;\n        t = im[i]; im[i] = im[j]; im[j] = t;\n      }\n    }\n    for (let len = 2; len <= n; len <<= 1) {\n      const half = len >> 1;\n      const step = n / len;\n      for (let i = 0; i < n; i += len) {\n        for (let k = 0, tw = 0; k < half; k++, tw += step) {\n          const wr = cos[tw], wi = sin[tw];\n          const a = i + k, b = a + half;\n          const vr = re[b] * wr - im[b] * wi;\n          const vi = re[b] * wi + im[b] * wr;\n          re[b] = re[a] - vr; im[b] = im[a] - vi;\n          re[a] += vr;        im[a] += vi;\n        }\n      }\n    }\n  }\n\n  // 共軛 → forward → 共軛 → 1/N\n  inverse(re, im) {\n    const { n } = this;\n    for (let i = 0; i < n; i++) im[i] = -im[i];\n    this.forward(re, im);\n    const s = 1 / n;\n    for (let i = 0; i < n; i++) { re[i] *= s; im[i] = -im[i] * s; }\n  }\n}\n\n// 以 FFT 做循環相關：回傳 |correlation| 的平方，長度 nfft。\n// 用於 chirp 前導的匹配濾波 —— 直接時域相關在 4096 tap 下太慢。\nfunction correlateMagSq(signal, offset, len, template, nfft) {\n  const fft = new FFT(nfft);\n  const ar = new Float64Array(nfft), ai = new Float64Array(nfft);\n  const br = new Float64Array(nfft), bi = new Float64Array(nfft);\n  for (let i = 0; i < len && offset + i < signal.length; i++) ar[i] = signal[offset + i];\n  for (let i = 0; i < template.length; i++) br[i] = template[i];\n  fft.forward(ar, ai);\n  fft.forward(br, bi);\n  // A · conj(B)\n  for (let k = 0; k < nfft; k++) {\n    const rr = ar[k] * br[k] + ai[k] * bi[k];\n    const ii = ai[k] * br[k] - ar[k] * bi[k];\n    ar[k] = rr; ai[k] = ii;\n  }\n  fft.inverse(ar, ai);\n  const out = new Float64Array(nfft);\n  for (let k = 0; k < nfft; k++) out[k] = ar[k] * ar[k] + ai[k] * ai[k];\n  return out;\n}\n\n// ═══ ../src/dsp/interp.js ══════════════════════════════════════\n// 小數位置的 sinc 插值。\n//\n// 收發時脈差的補償靠它，而我們的頻帶頂端 22 kHz 已達 0.917 Nyquist ——\n// 過渡帶只剩 2 kHz（0.042·fs）。窗函數選錯會直接在那裡崩掉：\n// 原本用 32-tap Blackman，在 offset=0.5 時 20 kHz 尚有 63 dB，\n// 22 kHz 卻只剩 16.7 dB，接收端一開啟小數取樣就把頻帶頂端毀掉。\n//\n// 改用 Kaiser(β=8) 並加長到 64 tap。經驗式 N ≈ A/(22·Δf/fs)：\n// 60 dB 阻帶配 0.042 的過渡帶約需 65 tap。\n\nconst TAPS = 64;\nconst INTERP_HALF = TAPS / 2;\nconst BETA = 8.0;\n\nfunction besselI0(x) {\n  let sum = 1, term = 1;\n  const h = (x * x) / 4;\n  for (let k = 1; k < 40; k++) {\n    term *= h / (k * k);\n    sum += term;\n    if (term < 1e-16 * sum) break;\n  }\n  return sum;\n}\n\n// 窗只跟 tap 序號有關，與小數位置無關，先算好\nconst WIN = new Float64Array(TAPS);\n{\n  const denom = besselI0(BETA);\n  for (let i = 0; i < TAPS; i++) {\n    const r = (2 * i) / (TAPS - 1) - 1;\n    WIN[i] = besselI0(BETA * Math.sqrt(Math.max(0, 1 - r * r))) / denom;\n  }\n}\n\nfunction sincAt(x, pos) {\n  const i0 = Math.floor(pos);\n  const frac = pos - i0;\n  let acc = 0;\n  for (let t = -INTERP_HALF + 1, w = 0; t <= INTERP_HALF; t++, w++) {\n    const idx = i0 + t;\n    if (idx < 0 || idx >= x.length) continue;\n    const d = t - frac;\n    const s = Math.abs(d) < 1e-9 ? 1 : Math.sin(Math.PI * d) / (Math.PI * d);\n    acc += x[idx] * s * WIN[w];\n  }\n  return acc;\n}\n\n// out[n] = x[n·ratio]，不引入額外延遲\nfunction resample(x, ratio) {\n  const outLen = Math.floor((x.length - INTERP_HALF) / ratio);\n  const out = new Float32Array(Math.max(0, outLen));\n  for (let n = 0; n < out.length; n++) out[n] = sincAt(x, n * ratio);\n  return out;\n}\n\n// ═══ ../src/dsp/prng.js ════════════════════════════════════════\n// 固定種子的 xorshift32。收發兩端必須產生完全相同的 pilot 與 probe 序列，\r\n// 所以不能用 Math.random —— 這裡要的是可重現，不是隨機。\r\n/**\r\n * 32-bit 整數雪崩混合（splitmix32 的 finalizer）。\r\n *\r\n * xorshift32 對「連續的小種子」極度不友善：seed=1 的第一個輸出只有 270305，\r\n * 除以 2³² 得 6.3e-5 —— 拿去查機率分布會一律落在最小的那一格。\r\n * 噴泉碼的封包序號正好就是 0,1,2,3…，不先打散的話所有封包都會拿到度數 1，\r\n * 整個噴泉碼退化成隨機挑塊（實測解碼開銷從 1.05×K 惡化到 3.8×K）。\r\n */\r\nfunction mix32(x) {\r\n  x = (x ^ (x >>> 16)) >>> 0;\r\n  x = Math.imul(x, 0x7feb352d) >>> 0;\r\n  x = (x ^ (x >>> 15)) >>> 0;\r\n  x = Math.imul(x, 0x846ca68b) >>> 0;\r\n  x = (x ^ (x >>> 16)) >>> 0;\r\n  return x >>> 0;\r\n}\r\n\r\nfunction xorshift32(seed) {\r\n  let s = seed >>> 0 || 0x9e3779b9;\r\n  return () => {\r\n    s ^= s << 13; s >>>= 0;\r\n    s ^= s >>> 17;\r\n    s ^= s << 5;  s >>>= 0;\r\n    return s;\r\n  };\r\n}\r\n\r\n// 產生 n 個 QPSK 符元（單位功率），供 probe 與 pilot 使用。\r\nfunction pskSequence(n, seed) {\r\n  const rnd = xorshift32(seed);\r\n  const re = new Float64Array(n);\r\n  const im = new Float64Array(n);\r\n  const a = Math.SQRT1_2;\r\n  for (let i = 0; i < n; i++) {\r\n    const v = rnd();\r\n    re[i] = (v & 1) ? a : -a;\r\n    im[i] = (v & 2) ? a : -a;\r\n  }\r\n  return { re, im };\r\n}\r\n\r\n// 高斯雜訊（Box-Muller）。模擬用，種子固定以便重現失敗案例。\r\nfunction gaussianSource(seed) {\r\n  const rnd = xorshift32(seed);\r\n  const u = () => (rnd() + 1) / 4294967297;\r\n  let spare = null;\r\n  return () => {\r\n    if (spare !== null) { const v = spare; spare = null; return v; }\r\n    const r = Math.sqrt(-2 * Math.log(u()));\r\n    const t = 2 * Math.PI * u();\r\n    spare = r * Math.sin(t);\r\n    return r * Math.cos(t);\r\n  };\r\n}\n\n// ═══ ../src/modem/plan.js ══════════════════════════════════════\n// OFDM 參數與副載波配置。所有數字都來自 Step 0 的實測結論。\r\n\r\nconst SR = 48000;\r\nconst N = 1024;          // FFT 大小 → 副載波間距 46.875 Hz\r\nconst CP = 128;          // cyclic prefix，2.67 ms\r\nconst SYM = N + CP;      // 1152 samples = 24 ms → 41.67 symbol/s\r\nconst BIN_HZ = SR / N;\r\n\r\n// Step 0 定案：stealth 砍成 18–22 kHz（真正無聲，且避開筆電 16–18 kHz 的線圈嘯叫）\r\n// 上限 21.2 kHz 而不是 22 kHz。\r\n//\r\n// 48 kHz 取樣路徑的抗混疊濾波器從 21.1 kHz 開始下降，而且兩端的喇叭與\r\n// 麥克風各自再疊一層。實測 PC→手機：21.0 kHz 還有 43 dB 對比，21.5 掉到 32，\r\n// 21.75 剩 23，22.0 只有 12.6 dB —— 隔兩小時再量，22 kHz 直接量不到訊號。\r\n//\r\n// 那幾個 bin 不是「比較差」，是每個符元都在丟隨機 bit。頻段頂端佔 13% 的\r\n// 副載波，BPSK 下就是 6.5% 的位元錯誤率 —— 每個封包必壞。實測封包遺失率\r\n// 94%，而平均 SNR 看起來還有 40 dB，完全看不出問題出在哪。\r\n// 少 20% 的頻寬換掉這件事非常划算。\r\nconst BANDS = {\r\n  turbo: { fLow: 2000, fHigh: 21200 },\r\n  stealth: { fLow: 18000, fHigh: 21200 },\r\n};\r\n\r\nconst PILOT_SPACING = 8;   // 每 8 個副載波插一個 pilot\r\nconst PROBE_SEED = 0x5741_5645;  // \"WAVE\"\r\nconst PILOT_SEED = 0x50494c54;   // \"PILT\"\r\n\r\n// Step 0 定案：兩個模式都封頂 64QAM。256QAM 在瓶頸方向只換到 +8~13%，\r\n// 不值得為它承擔 1–2 度的相位精度要求。\r\nconst MAX_BITS = 6;\r\nconst GAP_DB = 6;                 // BER 1e-6 並計入編碼增益的實務差距\r\nconst LADDER = [6, 4, 2, 1];      // 64QAM / 16QAM / QPSK / BPSK\r\n\r\nfunction bitsForSnr(snrDb, maxBits = MAX_BITS) {\r\n  if (!isFinite(snrDb)) return 0;\r\n  const eff = snrDb - GAP_DB;\r\n  if (eff <= 0) return 0;\r\n  const cap = Math.log2(1 + Math.pow(10, eff / 10));\r\n  for (const b of LADDER) if (b <= maxBits && cap >= b) return b;\r\n  return 0;\r\n}\r\n\r\n/**\r\n * 建立傳輸計畫。\r\n * @param {object} opts\r\n * @param {'turbo'|'stealth'} opts.band\r\n * @param {Map<number,number>|null} opts.snrByBin  每個 bin 的實測 SNR(dB)；null 表示全部用 fallbackBits\r\n * @param {number} opts.fallbackBits  沒有量測資料時的保守預設\r\n * @param {number} opts.maxBits\r\n */\r\n/**\r\n * 頻段的骨架：有哪些 bin、哪些當 pilot、剩下哪些可以載資料。\r\n * 抽出來是因為「配置表」的索引必須兩端一致 —— 表裡的第 i 個項目對應\r\n * candidates[i]，這個對應關係只能有一個定義。\r\n */\r\nfunction bandBins(band) {\r\n  const spec = BANDS[band];\r\n  if (!spec) throw new Error(`unknown band: ${band}`);\r\n  const binLow = Math.max(1, Math.ceil(spec.fLow / BIN_HZ));\r\n  const binHigh = Math.min(N / 2 - 1, Math.floor(spec.fHigh / BIN_HZ));\r\n  const bins = [];\r\n  for (let k = binLow; k <= binHigh; k++) bins.push(k);\r\n\r\n  // pilot 均勻分佈；兩端各放一個，讓相位斜率的線性擬合不外插\r\n  const pilotSet = new Set();\r\n  for (let i = 0; i < bins.length; i += PILOT_SPACING) pilotSet.add(bins[i]);\r\n  pilotSet.add(bins[bins.length - 1]);\r\n\r\n  return {\r\n    spec, binLow, binHigh, bins, pilotSet,\r\n    pilotBins: bins.filter((k) => pilotSet.has(k)),\r\n    candidates: bins.filter((k) => !pilotSet.has(k)),\r\n  };\r\n}\r\n\r\nfunction makePlan({ band = 'turbo', snrByBin = null, bitsTable = null,\r\n  fallbackBits = 2, maxBits = MAX_BITS } = {}) {\r\n  const { spec, binLow, binHigh, bins, pilotSet, pilotBins, candidates } = bandBins(band);\r\n\r\n  const dataBins = [];\r\n  const bitsByBin = new Map();\r\n  let bitsPerSymbol = 0;\r\n\r\n  for (let i = 0; i < candidates.length; i++) {\r\n    const k = candidates[i];\r\n    // bitsTable 優先：那是兩端談好的結果，必須逐位元照做。\r\n    // 用 snrByBin 各自推算是不行的 —— 兩端量到的 SNR 不會一樣。\r\n    const b = bitsTable ? bitsTable[i]\r\n      : snrByBin ? bitsForSnr(snrByBin.get(k) ?? -Infinity, maxBits)\r\n        : fallbackBits;\r\n    if (!(b > 0)) continue;\r\n    dataBins.push(k);\r\n    bitsByBin.set(k, b);\r\n    bitsPerSymbol += b;\r\n  }\r\n\r\n  return {\r\n    band, spec, binLow, binHigh,\r\n    bins, pilotBins, dataBins, bitsByBin,\r\n    bitsPerSymbol,\r\n    rawBps: (bitsPerSymbol * SR) / SYM,\r\n    symbolSec: SYM / SR,\r\n  };\r\n}\r\n\r\n// 把 Step 0 摘要那種「每 250 Hz 一個整數 dB」的曲線攤成逐 bin 的 SNR。\r\n// 線性內插即可 —— 我們只用它決定調變階數，不需要更精細。\r\nfunction snrCurveToBins(curve) {\r\n  const pts = [...curve].sort((a, b) => a[0] - b[0]);\r\n  const out = new Map();\r\n  for (let k = 1; k < N / 2; k++) {\r\n    const hz = k * BIN_HZ;\r\n    if (hz < pts[0][0] || hz > pts[pts.length - 1][0]) continue;\r\n    let i = 0;\r\n    while (i < pts.length - 2 && pts[i + 1][0] < hz) i++;\r\n    const [x0, y0] = pts[i], [x1, y1] = pts[i + 1];\r\n    out.set(k, x1 === x0 ? y0 : y0 + ((y1 - y0) * (hz - x0)) / (x1 - x0));\r\n  }\r\n  return out;\r\n}\n\n// ═══ ../src/modem/qam.js ═══════════════════════════════════════\n// Gray 編碼的方形 QAM：BPSK(1) / QPSK(2) / 16QAM(4) / 64QAM(6)。\n//\n// b 為偶數時 I、Q 各分 b/2 個位元，各自是 L=2^(b/2) 階的 Gray PAM。\n// 每個星座都正規化成單位平均功率，等化與 SNR 換算才有共同基準。\n\nconst cache = new Map();\n\nfunction grayToBinary(g) {\n  let b = g;\n  for (let s = 1; s < 32; s <<= 1) b ^= b >>> s;\n  return b;\n}\n\nfunction pamLevels(halfBits) {\n  const L = 1 << halfBits;\n  const lv = new Float64Array(L);\n  for (let g = 0; g < L; g++) lv[g] = 2 * grayToBinary(g) - (L - 1);\n  return lv;\n}\n\nfunction constellation(bits) {\n  if (cache.has(bits)) return cache.get(bits);\n  let c;\n  if (bits === 1) {\n    c = { bits, bpsk: true, levels: null, scale: 1, L: 2 };\n  } else {\n    if (bits % 2 !== 0) throw new Error(`unsupported bits/subcarrier: ${bits}`);\n    const half = bits / 2;\n    const L = 1 << half;\n    // E[|s|²] = 2·E[I²]，E[I²] = (L²−1)/3\n    c = { bits, bpsk: false, levels: pamLevels(half), scale: 1 / Math.sqrt((2 * (L * L - 1)) / 3), L, half };\n  }\n  cache.set(bits, c);\n  return c;\n}\n\n// 從 bit reader 取 b 個位元映射成一個複數符元\nfunction mapSymbol(readBits, bits) {\n  const c = constellation(bits);\n  if (c.bpsk) return [readBits(1) ? 1 : -1, 0];\n  const gi = readBits(c.half);\n  const gq = readBits(c.half);\n  return [c.levels[gi] * c.scale, c.levels[gq] * c.scale];\n}\n\n// 硬判決解映射，回傳 b 個位元（最高位在前，與 mapSymbol 對應）\nfunction demapSymbol(re, im, bits, writeBits) {\n  const c = constellation(bits);\n  if (c.bpsk) { writeBits(re > 0 ? 1 : 0, 1); return; }\n  writeBits(nearestGray(re / c.scale, c), c.half);\n  writeBits(nearestGray(im / c.scale, c), c.half);\n}\n\nfunction nearestGray(v, c) {\n  let best = 0, bd = Infinity;\n  for (let g = 0; g < c.L; g++) {\n    const d = Math.abs(v - c.levels[g]);\n    if (d < bd) { bd = d; best = g; }\n  }\n  return best;\n}\n\n// 位元讀寫器：以 MSB-first 打包進 Uint8Array\nfunction bitReader(bytes) {\n  let pos = 0;\n  return {\n    read(n) {\n      let v = 0;\n      for (let i = 0; i < n; i++) {\n        const byte = bytes[pos >> 3] ?? 0;\n        v = (v << 1) | ((byte >> (7 - (pos & 7))) & 1);\n        pos++;\n      }\n      return v;\n    },\n    get consumed() { return pos; },\n  };\n}\n\nfunction bitWriter(byteLen) {\n  const bytes = new Uint8Array(byteLen);\n  let pos = 0;\n  return {\n    write(v, n) {\n      for (let i = n - 1; i >= 0; i--) {\n        if ((v >> i) & 1) bytes[pos >> 3] |= 1 << (7 - (pos & 7));\n        pos++;\n      }\n    },\n    get bytes() { return bytes; },\n    get written() { return pos; },\n  };\n}\n\n// ═══ ../src/modem/frame.js ═════════════════════════════════════\n// 訊框結構與同步前導。\r\n//\r\n//   [ CHIRP 4096 ] [ GUARD 512 ] [ PROBE ×2 ] [ DATA ×D ]\r\n//\r\n// 用線性掃頻（chirp）而非 Schmidl-Cox 式的重複前導，理由是聲學通道：\r\n// chirp 的匹配濾波在多重路徑下仍給出銳利的峰，且處理增益 = BW×T\r\n// （stealth 模式 4 kHz × 85 ms ≈ 25 dB），在低 SNR 方向仍站得住。\r\nconst CHIRP_LEN = 4096;\r\nconst GUARD = 512;\r\n// 送 5 個 probe，接收端丟掉第一個只用後 4 個。\r\n// 第一個 probe 的前面是靜音，其餘的前面都是 probe —— ISI 條件不同。\r\n// 把它一起拿去平均，那個系統性差異會被雜訊估計器誤判成雜訊，\r\n// 回音越強誤判越大（實測 95 sample 的回音讓 SNR 憑空少報 8 dB）。\r\nconst PROBE_SYMS = 5;\r\nconst PROBE_SKIP = 1;\r\nconst PROBE_USED = PROBE_SYMS - PROBE_SKIP;\r\nconst PREAMBLE_LEN = CHIRP_LEN + GUARD;\r\n\r\n// Tukey 窗，避免掃頻起訖的方波邊緣灑出寬頻雜訊污染鄰近頻段\r\nfunction tukey(n, alpha = 0.15) {\r\n  const w = new Float64Array(n);\r\n  const edge = Math.floor((alpha * (n - 1)) / 2);\r\n  for (let i = 0; i < n; i++) {\r\n    if (i < edge) w[i] = 0.5 * (1 + Math.cos(Math.PI * (i / edge - 1)));\r\n    else if (i > n - 1 - edge) w[i] = 0.5 * (1 + Math.cos(Math.PI * ((n - 1 - i) / edge - 1)));\r\n    else w[i] = 1;\r\n  }\r\n  return w;\r\n}\r\n\r\nfunction makeChirp(fLow, fHigh, len = CHIRP_LEN, sr = SR) {\r\n  const w = tukey(len);\r\n  const out = new Float64Array(len);\r\n  const rate = (fHigh - fLow) / (len / sr);\r\n  for (let i = 0; i < len; i++) {\r\n    const t = i / sr;\r\n    out[i] = w[i] * Math.cos(2 * Math.PI * (fLow * t + 0.5 * rate * t * t));\r\n  }\r\n  return out;\r\n}\r\n\r\n// probe 各符元用同一組值：H 估計可平均降噪 10·log10(PROBE_SYMS) dB，\r\n// 且兩個符元在時域完全相同，日後要加二次同步確認很方便。\r\nfunction probeSequence(plan) {\r\n  return pskSequence(plan.bins.length, PROBE_SEED);\r\n}\r\n\r\nfunction pilotSequence(plan, symbolIndex) {\r\n  return pskSequence(plan.pilotBins.length, (PILOT_SEED + symbolIndex * 0x9e3779b9) >>> 0);\r\n}\r\n\r\n/**\r\n * 以匹配濾波找 chirp 起點。\r\n * @returns {{index:number, peak:number, ratio:number}} ratio 為峰值對背景中位數的比，\r\n *          低於 ~8 表示沒抓到，應視為同步失敗而非硬用一個錯誤位置。\r\n */\r\nfunction findPreamble(signal, chirp, searchFrom = 0, searchLen = signal.length) {\r\n  const len = Math.min(searchLen, signal.length - searchFrom);\r\n  if (len < chirp.length) return { index: -1, peak: 0, ratio: 0 };\r\n\r\n  let nfft = 1;\r\n  while (nfft < len + chirp.length) nfft <<= 1;\r\n  const corr = correlateMagSq(signal, searchFrom, len, chirp, nfft);\r\n\r\n  const valid = len - chirp.length + 1;\r\n  let best = 0, peak = -1;\r\n  for (let m = 0; m < valid; m++) if (corr[m] > peak) { peak = corr[m]; best = m; }\r\n\r\n  // 用中位數當背景，避免峰值本身把平均值拉高\r\n  const sample = [];\r\n  const stride = Math.max(1, Math.floor(valid / 2048));\r\n  for (let m = 0; m < valid; m += stride) sample.push(corr[m]);\r\n  sample.sort((a, b) => a - b);\r\n  const median = sample[sample.length >> 1] || 1e-30;\r\n\r\n  return { index: searchFrom + best, peak, ratio: Math.sqrt(peak / median) };\r\n}\r\n\r\n// 目標波峰因數。OFDM 原生的 PAPR 高達 18.7 dB（stealth），峰值把功放逼進\r\n// 非線性區，而平均功率卻很低。後果有兩個：\r\n//   1. 二階互調把頻帶內任兩個副載波的差頻生出來。stealth 是 18–22 kHz，\r\n//      差頻正好落在 0–4 kHz —— 最容易聽見的範圍。「超音波模式卻聽得到聲音」\r\n//      就是這樣來的（跟指向性喇叭的原理相同）。\r\n//   2. 帶內失真吃掉 SNR。Step 1b 量到原始頻譜 SNR 49 dB 但星座只有 19 dB，\r\n//      30 dB 的缺口就是這個。\r\n// 削到 11 dB：stealth 的 PAPR 18.7→12.6、turbo 25.1→11.2，\r\n// 同樣峰值下平均功率多 7~15 dB。搭配把輸出調低同樣的量，峰值就離開\r\n// 非線性區，二階互調降約 14 dB，而接收端的訊號強度不變。\r\nconst TARGET_PAPR_DB = 11;\r\nconst PAPR_ITERATIONS = 3;\r\n\r\n/**\r\n * 削峰 + 濾波，反覆數次。\r\n *\r\n * 單純削峰會把能量灑到頻帶外（對 stealth 來說就是灑進可聽範圍），\r\n * 所以每次削完都要濾回頻帶內；但濾波又會讓峰值部分長回來，故需迭代。\r\n * 代價是帶內失真（EVM），11 dB 目標下 stealth 約 −32 dB、turbo 約 −21 dB，\r\n * 都低於通道本身的雜訊（實測 19–22 dB）。\r\n */\r\nfunction clipAndFilter(re, im, fft, bins) {\r\n  let rms = 0;\r\n  for (let i = 0; i < N; i++) rms += re[i] * re[i];\r\n  rms = Math.sqrt(rms / N);\r\n  if (rms <= 0) return;\r\n  const limit = rms * Math.pow(10, TARGET_PAPR_DB / 20);\r\n\r\n  const inBand = new Uint8Array(N);\r\n  for (const k of bins) { inBand[k] = 1; inBand[N - k] = 1; }\r\n\r\n  for (let it = 0; it < PAPR_ITERATIONS; it++) {\r\n    let clipped = 0;\r\n    for (let i = 0; i < N; i++) {\r\n      if (re[i] > limit) { re[i] = limit; clipped++; }\r\n      else if (re[i] < -limit) { re[i] = -limit; clipped++; }\r\n    }\r\n    if (!clipped) break;\r\n\r\n    im.fill(0);\r\n    fft.forward(re, im);\r\n    for (let k = 0; k < N; k++) if (!inBand[k]) { re[k] = 0; im[k] = 0; }\r\n    fft.inverse(re, im);\r\n  }\r\n}\r\n\r\n// 符元邊緣的升餘弦過渡長度。\r\n//\r\n// 每個符元單獨看是完美帶限的（實測帶外 −158 dB），但把符元接起來時\r\n// 邊界不連續，那個階躍會灑出寬頻噪音 —— 實測連續串接時 2–4 kHz 只有\r\n// −59 dB，對 stealth 來說就是直接可聽的雜音。\r\n//\r\n// 解法是讓每個符元多帶一段循環後綴，兩端各做一次升餘弦漸變，\r\n// 相鄰符元重疊相加。漸變區會吃掉 CP 的前 WINDOW 個 sample\r\n// （接收端的 FFT 視窗本來就從 CP−16 開始，剩下的延遲擴散預算\r\n// 從 112 降到 88，仍高於實測需要的 63）。\r\nconst SYM_WINDOW = 24;\r\nconst RAMP = (() => {\r\n  const r = new Float64Array(SYM_WINDOW);\r\n  for (let i = 0; i < SYM_WINDOW; i++) r[i] = 0.5 - 0.5 * Math.cos((Math.PI * (i + 0.5)) / SYM_WINDOW);\r\n  return r;\r\n})();\r\n\r\n// 把一組複數副載波值做 Hermitian 對稱擴展後 IFFT，得到實數時域符元。\r\n// 回傳長度為 SYM + SYM_WINDOW：多出來的是循環後綴，供重疊相加用。\r\nfunction toTimeSymbol(fft, specRe, specIm, bins = null) {\r\n  const re = new Float64Array(N), im = new Float64Array(N);\r\n  for (let k = 1; k < N / 2; k++) {\r\n    re[k] = specRe[k]; im[k] = specIm[k];\r\n    re[N - k] = specRe[k]; im[N - k] = -specIm[k];\r\n  }\r\n  re[0] = 0; im[0] = 0;\r\n  re[N / 2] = 0; im[N / 2] = 0;\r\n  fft.inverse(re, im);\r\n\r\n  if (bins) clipAndFilter(re, im, fft, bins);\r\n\r\n  const out = new Float64Array(SYM + SYM_WINDOW);\r\n  for (let i = 0; i < CP; i++) out[i] = re[N - CP + i];\r\n  for (let i = 0; i < N; i++) out[CP + i] = re[i];\r\n  // 循環後綴：body 的開頭，接在最後面\r\n  for (let i = 0; i < SYM_WINDOW; i++) out[SYM + i] = re[i];\r\n  // 兩端各做一次升餘弦漸變\r\n  for (let i = 0; i < SYM_WINDOW; i++) {\r\n    out[i] *= RAMP[i];\r\n    out[SYM + SYM_WINDOW - 1 - i] *= RAMP[i];\r\n  }\r\n  return out;\r\n}\r\n\r\n/**\r\n * 認出「錄到的其實是 Step 0 的探測訊號」。\r\n *\r\n * Step 0 的多音是嚴格以 N 個 sample 為週期的循環播放，OFDM 訊框不是。\r\n * 兩支工具的頻帶選項長得很像，很容易在 PC 上開著 Step 0 就按了播放 ——\r\n * 那樣會錄到看似正常、實則完全解不開的訊號，而解調端只會報 BER 0.5，\r\n * 讓人往錯的方向查。這裡直接指出來。\r\n *\r\n * @returns {{isStep0:boolean, rho:number}} rho 接近 1 即為 Step 0 訊號\r\n */\r\nfunction detectStep0Signal(samples, offset = 0, len = 40000) {\r\n  const end = Math.min(offset + len, samples.length - N);\r\n  let num = 0, d1 = 0, d2 = 0;\r\n  for (let i = offset; i < end; i++) {\r\n    const a = samples[i], b = samples[i + N];\r\n    num += a * b; d1 += a * a; d2 += b * b;\r\n  }\r\n  const rho = d1 > 0 && d2 > 0 ? num / Math.sqrt(d1 * d2) : 0;\r\n  return { isStep0: rho > 0.8, rho };\r\n}\r\n\r\nfunction makeFFT() {\r\n  return new FFT(N);\r\n}\n\n// ═══ ../src/modem/tx.js ════════════════════════════════════════\n\nconst TARGET_PEAK = 0.9;\r\n\r\n/**\r\n * 把位元組調變成一段完整訊框。\r\n * @param {Uint8Array} payload\r\n * @param {object} plan  makePlan() 的輸出\r\n * @returns {{samples: Float32Array, symbols: number, capacityBytes: number}}\r\n */\r\nfunction modulate(payload, plan, opts = {}) {\r\n  const fft = makeFFT();\r\n  // 先白化再上調變 —— 病態酬載（例如 manifest 的補零）會讓 PAPR 爆掉，\r\n  // 被 PAPR 抑制削平之後那幾個符元必定解錯。詳見 scramble.js\r\n  payload = scramble(payload, new Uint8Array(payload.length));\r\n  const bitsPerSym = plan.bitsPerSymbol;\r\n  if (bitsPerSym <= 0) throw new Error('plan 沒有任何可用副載波');\r\n\r\n  const symbols = Math.ceil((payload.length * 8) / bitsPerSym);\r\n  const capacityBytes = Math.floor((symbols * bitsPerSym) / 8);\r\n\r\n  const probe = probeSequence(plan);\r\n  const specRe = new Float64Array(N);\r\n  const specIm = new Float64Array(N);\r\n\r\n  const ofdm = [];\r\n\r\n  // ── probe：全頻帶已知 QPSK，兩個符元完全相同\r\n  specRe.fill(0); specIm.fill(0);\r\n  plan.bins.forEach((k, i) => { specRe[k] = probe.re[i]; specIm[k] = probe.im[i]; });\r\n  const probeSym = toTimeSymbol(fft, specRe, specIm, plan.bins);\r\n  for (let i = 0; i < PROBE_SYMS; i++) ofdm.push(probeSym);\r\n\r\n  // ── data\r\n  const reader = bitReader(payload);\r\n  const read = reader.read.bind(reader);\r\n  for (let s = 0; s < symbols; s++) {\r\n    specRe.fill(0); specIm.fill(0);\r\n    const pilots = pilotSequence(plan, s);\r\n    plan.pilotBins.forEach((k, i) => { specRe[k] = pilots.re[i]; specIm[k] = pilots.im[i]; });\r\n    for (const k of plan.dataBins) {\r\n      const [re, im] = mapSymbol(read, plan.bitsByBin.get(k));\r\n      specRe[k] = re; specIm[k] = im;\r\n    }\r\n    ofdm.push(toTimeSymbol(fft, specRe, specIm, plan.bins));\r\n  }\r\n\r\n  // OFDM 的 PAPR 高，chirp 近乎定包絡。分開正規化到同一個峰值，\r\n  // 讓兩者都用滿動態範圍 —— chirp 因此帶著遠高於資料段的能量，\r\n  // 這對同步是好事（處理增益全給了最需要可靠的那一步）。\r\n  let peak = 0;\r\n  for (const sym of ofdm) for (const v of sym) { const a = Math.abs(v); if (a > peak) peak = a; }\r\n  const gain = peak > 0 ? TARGET_PEAK / peak : 0;\r\n\r\n  // ACK 走反向掃頻，兩者的匹配濾波幾乎不互相響應，不會彼此誤認\r\n  const chirp = opts.chirp ?? makeChirp(plan.spec.fLow, plan.spec.fHigh);\r\n  // 尾端多留 SYM_WINDOW 讓最後一個符元的漸變收乾淨\r\n  const total = PREAMBLE_LEN + ofdm.length * SYM + SYM_WINDOW;\r\n  const out = new Float32Array(total);\r\n\r\n  for (let i = 0; i < CHIRP_LEN; i++) out[i] = chirp[i] * TARGET_PEAK;\r\n  // 重疊相加：每個符元前進 SYM，但長度是 SYM+SYM_WINDOW，\r\n  // 所以相鄰符元的漸變區會互相補上，接縫處不再有階躍。\r\n  let p = PREAMBLE_LEN;\r\n  for (const sym of ofdm) {\r\n    for (let i = 0; i < sym.length; i++) out[p + i] += sym[i] * gain;\r\n    p += SYM;\r\n  }\r\n\r\n  return { samples: out, symbols, capacityBytes, ofdmGain: gain };\r\n}\n\n// ═══ ../src/modem/scramble.js ══════════════════════════════════\n// 位元組擾亂器（scrambler）。\n//\n// 為什麼需要它：OFDM 把一整個符元的位元同時攤在所有副載波上，所以「資料\n// 長什麼樣」會直接決定時域波形的峰均比。全零的酬載在 BPSK 下讓每個副載波\n// 都拿到同一個星座點，相位一致 —— 時域上就是一根脈衝。\n//\n// 實測：manifest 封包有 65/92 個位元組是補零，它那 10 個符元的 PAPR 衝到\n// 16.6 dB，其他符元只有 11 dB。而 PAPR 抑制的目標就是 11 dB，於是那幾個\n// 符元被削平、CRC 必定失敗。症狀很難看懂 —— 17 個訊框只有 3 個認得出\n// manifest，129 個資料封包因為沒有 manifest 可歸屬而整批丟掉，\n// 但「封包遺失率」看起來只有 20%。\n//\n// 解法就是 802.11 / DVB 都在用的那一招：傳送前把位元組流和一段固定的\n// 虛擬亂數序列 XOR，收下來再 XOR 回去。資料被白化之後就不會有病態圖樣。\n// 這一層放在 modem 內部，所以資料訊框與 ACK 訊框自動都受保護。\n\nconst TABLE_BYTES = 8192;        // 遠大於任何一個訊框，循環痕跡不會落在符元邊界上\n\nconst TABLE = (() => {\n  const t = new Uint8Array(TABLE_BYTES);\n  const r = xorshift32(mix32(0x57415645));   // 'WAVE'\n  for (let i = 0; i < TABLE_BYTES; i++) t[i] = r() & 0xff;\n  return t;\n})();\n\n/**\n * 就地擾亂／解擾亂（XOR 是自反的，同一個函式兩用）。\n * @param {Uint8Array} bytes\n * @param {Uint8Array} [out] 給定時不改動輸入\n */\nfunction scramble(bytes, out = bytes) {\n  for (let i = 0; i < bytes.length; i++) out[i] = bytes[i] ^ TABLE[i % TABLE_BYTES];\n  return out;\n}\n\n// ═══ ../src/modem/rx.js ════════════════════════════════════════\n\n// FFT 視窗比 CP 結尾提早這麼多開始。CP 的 128 個 sample 是一份要分配的預算：\r\n// 一部分給前導的定時誤差，剩下的才是能容忍的通道延遲擴散。\r\n//\r\n// chirp 匹配濾波的定時解析度約為 1/BW —— turbo 頻寬 20 kHz 時只有 2.4 個\r\n// sample，stealth 的 4 kHz 也才 12 個。原本取 32 過度保守，把延遲擴散預算\r\n// 壓到 96 samples；實測 95 sample 的回音就會踩線產生 ISI，而且劣化隨頻率\r\n// 遞增（20 kHz 處掉 12 dB）。改成 16 後預算為 112 samples ≈ 2.3 ms，\r\n// 對應 80 cm 的路徑差。\r\nconst WINDOW_ADVANCE = 16;\r\nconst MIN_SYNC_RATIO = 8;\r\n\r\n// 實體時脈差的上限。消費級音訊晶振通常在 ±50 ppm 內，兩台裝置相加也不會\r\n// 超過幾百 ppm。低 SNR 時漂移估計是純噪音，不設限就會算出離譜的 step\r\n// 去重讀 probe，整條解調鏈當場崩掉（實測 BPSK 4 dB 時 SNR 掉到 −24 dB）。\r\nconst MAX_PPM = 1000;\r\nconst clampRho = (r) => Math.max(-MAX_PPM / 1e6, Math.min(MAX_PPM / 1e6, r || 0));\r\n\r\n// step 為 1 時走整數索引的快路；只有需要補償時脈差時才付插值的代價。\r\nfunction fftAt(fft, samples, start, re, im, step = 1) {\r\n  if (step === 1 && Number.isInteger(start)) {\r\n    for (let i = 0; i < N; i++) {\r\n      const idx = start + i;\r\n      re[i] = idx >= 0 && idx < samples.length ? samples[idx] : 0;\r\n      im[i] = 0;\r\n    }\r\n  } else {\r\n    for (let i = 0; i < N; i++) {\r\n      const pos = start + i * step;\r\n      re[i] = pos >= 0 && pos < samples.length - 1 ? sincAt(samples, pos) : 0;\r\n      im[i] = 0;\r\n    }\r\n  }\r\n  fft.forward(re, im);\r\n}\r\n\r\n// 5-tap 二項式平滑。殘餘相位在頻率上是一條直線，而對稱濾波器作用在\r\n// 線性相位斜坡上只會等比縮小振幅、完全不動相位，所以這個平滑不引入偏差，\r\n// 只換來約 5.6 dB 的噪音抑制。\r\nconst SMOOTH = [1, 4, 6, 4, 1];\r\nconst SMOOTH_SUM = 16;\r\n\r\n/**\r\n * 由 pilot 殘餘估出「每個 bin 各自的」相位校正量。\r\n *\r\n * 不用全域線性擬合 —— 那會把斜率的估計誤差外推到頻帶兩端放大兩百倍以上，\r\n * 低 SNR 時整個星座直接被轉爛（實測 BPSK 4 dB、QPSK 7 dB 全毀，\r\n * 而同時 16/64QAM 因為配的 SNR 高所以看起來正常，差點誤導成「低階調變有問題」）。\r\n * 改成只在相鄰 pilot 之間內插：每個資料副載波的校正只來自它左右兩個 pilot，\r\n * 噪音不會被外推。\r\n *\r\n * @returns {{corrRe:Float64Array, corrIm:Float64Array, tau:number}}\r\n *          corr 為單位長度的共軛校正子；tau 僅供視窗追蹤的慢速回饋使用。\r\n */\r\nfunction pilotCorrection(zRe, zIm, plan, pilots, out) {\r\n  const bins = plan.pilotBins;\r\n  const n = bins.length;\r\n  const { rawRe, rawIm, smRe, smIm, corrRe, corrIm } = out;\r\n\r\n  for (let i = 0; i < n; i++) {\r\n    const k = bins[i];\r\n    const pr = pilots.re[i], pi = pilots.im[i];\r\n    rawRe[i] = zRe[k] * pr + zIm[k] * pi;\r\n    rawIm[i] = zIm[k] * pr - zRe[k] * pi;\r\n  }\r\n\r\n  for (let i = 0; i < n; i++) {\r\n    let ar = 0, ai = 0;\r\n    for (let t = -2; t <= 2; t++) {\r\n      let j = i + t;\r\n      if (j < 0) j = -j;                    // 邊界反射\r\n      if (j >= n) j = 2 * (n - 1) - j;\r\n      const w = SMOOTH[t + 2];\r\n      ar += rawRe[j] * w; ai += rawIm[j] * w;\r\n    }\r\n    smRe[i] = ar / SMOOTH_SUM; smIm[i] = ai / SMOOTH_SUM;\r\n  }\r\n\r\n  // 相鄰 pilot 之間做正規化線性內插（nlerp）。相位差在 ±π 內時，\r\n  // 弦與弧的差異只影響振幅，我們只取相位，所以無妨。\r\n  for (let i = 0; i < n - 1; i++) {\r\n    const k0 = bins[i], k1 = bins[i + 1];\r\n    const span = k1 - k0;\r\n    for (let k = k0; k < k1; k++) {\r\n      const t = (k - k0) / span;\r\n      const ar = smRe[i] * (1 - t) + smRe[i + 1] * t;\r\n      const ai = smIm[i] * (1 - t) + smIm[i + 1] * t;\r\n      const m = Math.hypot(ar, ai) || 1;\r\n      corrRe[k] = ar / m; corrIm[k] = -ai / m;   // 共軛 → 用乘的就能抵銷\r\n    }\r\n  }\r\n  {\r\n    const k = bins[n - 1];\r\n    const m = Math.hypot(smRe[n - 1], smIm[n - 1]) || 1;\r\n    corrRe[k] = smRe[n - 1] / m; corrIm[k] = -smIm[n - 1] / m;\r\n  }\r\n\r\n  // 視窗追蹤要的 τ：整個頻帶的平均相位斜率。這裡外推誤差無所謂，\r\n  // 因為它只餵進一個慢速的整數視窗回饋，還會再經過時間上的平滑。\r\n  //\r\n  // 符號：視窗晚 τ 個 sample 時取到的是 x[n+τ]，而 DFT{x[n+τ]}[k]\r\n  // = X[k]·e^{+j2πkτ/N}，所以斜率為正 → τ = slope·N/2π。\r\n  let dr = 0, di = 0;\r\n  for (let i = 1; i < n; i++) {\r\n    if (bins[i] - bins[i - 1] !== PILOT_SPACING) continue;\r\n    dr += smRe[i] * smRe[i - 1] + smIm[i] * smIm[i - 1];\r\n    di += smIm[i] * smRe[i - 1] - smRe[i] * smIm[i - 1];\r\n  }\r\n  const slope = dr === 0 && di === 0 ? 0 : Math.atan2(di, dr) / PILOT_SPACING;\r\n\r\n  // 相干度：複數和的長度 ÷ 各項長度之和。1 代表所有相鄰 pilot 對給出一致的\r\n  // 相位差（鎖定），趨近 0 代表 τ 估計已是純噪音。低 SNR 時若不看這個就\r\n  // 硬更新迴路，積分項會隨機漫步跑掉（實測 BPSK 4 dB 直接失鎖）。\r\n  let magSum = 0;\r\n  for (let i = 1; i < n; i++) {\r\n    if (bins[i] - bins[i - 1] !== PILOT_SPACING) continue;\r\n    magSum += Math.hypot(smRe[i], smIm[i]) * Math.hypot(smRe[i - 1], smIm[i - 1]);\r\n  }\r\n  const coherence = magSum > 0 ? Math.hypot(dr, di) / magSum : 0;\r\n\r\n  // 未經校正的噪音估計。不能拿「校正後的 pilot」量 —— 校正量就是從這些\r\n  // pilot 自己算出來的，會把自身噪音抵掉一部分，SNR 被高估。\r\n  // 用 raw 對 smooth 的殘差，再除以平滑器的方差係數 (1−2w₀+Σw²) 還原。\r\n  let nAcc = 0, nCnt = 0;\r\n  for (let i = 0; i < n; i++) {\r\n    const dr2 = rawRe[i] - smRe[i], di2 = rawIm[i] - smIm[i];\r\n    nAcc += dr2 * dr2 + di2 * di2; nCnt++;\r\n  }\r\n  const RESID_FACTOR = 1 - (2 * SMOOTH[2]) / SMOOTH_SUM +\r\n    SMOOTH.reduce((a, v) => a + v * v, 0) / (SMOOTH_SUM * SMOOTH_SUM);\r\n\r\n  return { tau: (slope * N) / (2 * Math.PI), coherence, noiseVar: nCnt ? nAcc / nCnt / RESID_FACTOR : Infinity };\r\n}\r\n\r\n// 各 probe 符元相對第一個的定時差，以及由其斜率推得的時脈差。\r\nfunction estimateProbeDrift(hsRe, hsIm, bins) {\r\n  const dtau = new Float64Array(hsRe.length);\r\n  for (let s = 1; s < hsRe.length; s++) {\r\n    let dr = 0, di = 0;\r\n    for (let i = 1; i < bins.length; i++) {\r\n      if (bins[i] - bins[i - 1] !== 1) continue;\r\n      const k = bins[i], j = bins[i - 1];\r\n      // (H_s[k]·conj(H_0[k])) · conj(H_s[j]·conj(H_0[j]))\r\n      const ar = hsRe[s][k] * hsRe[0][k] + hsIm[s][k] * hsIm[0][k];\r\n      const ai = hsIm[s][k] * hsRe[0][k] - hsRe[s][k] * hsIm[0][k];\r\n      const br = hsRe[s][j] * hsRe[0][j] + hsIm[s][j] * hsIm[0][j];\r\n      const bi = hsIm[s][j] * hsRe[0][j] - hsRe[s][j] * hsIm[0][j];\r\n      dr += ar * br + ai * bi;\r\n      di += ai * br - ar * bi;\r\n    }\r\n    dtau[s] = dr === 0 && di === 0 ? 0 : (Math.atan2(di, dr) * N) / (2 * Math.PI);\r\n  }\r\n  // 用擬合出來的直線取代個別估計值。漂移對符元序號本來就是線性的，\r\n  // 而每個 dtau[s] 的估計噪音在去旋轉時會被乘上 2πk/N 放大到高頻 ——\r\n  // 直接拿個別值去旋轉，等於把噪音注進通道估計，逐 bin SNR 因此少報約 2 dB。\r\n  let sxy = 0, sxx = 0;\r\n  const mean = (dtau.length - 1) / 2;\r\n  let dm = 0;\r\n  for (let s = 0; s < dtau.length; s++) dm += dtau[s];\r\n  dm /= dtau.length;\r\n  for (let s = 0; s < dtau.length; s++) { sxy += (s - mean) * (dtau[s] - dm); sxx += (s - mean) ** 2; }\r\n  const perSym = sxx > 0 ? sxy / sxx : 0;\r\n\r\n  // 斜率往 0 收縮，收多少由「它跟自己的估計誤差比起來有多強」決定。\r\n  //\r\n  // 只有 4 個 probe 可以擬合，低 SNR 時斜率幾乎全是雜訊 —— 但迴路照單全收，\r\n  // 把 rho 推到極端值，星座整個轉掉。實測 8 dB 時接收端自估 SNR 從 8 掉到\r\n  // −12 dB，BER 比理論差 3.4 dB；而純粹把 rho 夾小雖然治好了低 SNR，\r\n  // 卻讓真的有 500 ppm 時追不上去。\r\n  //\r\n  // 這裡用 Wiener 收縮：w = b²/(b²+se²)。斜率遠大於其標準誤時 w→1，\r\n  // 高 SNR 與大偏移的情況完全不受影響；斜率和雜訊同量級時 w→0，\r\n  // 自動退化成「不追蹤」，而不是被雜訊牽著走。\r\n  let ss = 0;\r\n  for (let s = 0; s < dtau.length; s++) ss += (dtau[s] - (dm + (s - mean) * perSym)) ** 2;\r\n  const dof = Math.max(1, dtau.length - 2);\r\n  const se2 = sxx > 0 ? ss / dof / sxx : Infinity;\r\n  const w = perSym * perSym / (perSym * perSym + se2);\r\n  const slope = perSym * (Number.isFinite(w) ? w : 0);\r\n\r\n  const fit = new Float64Array(dtau.length);\r\n  for (let s = 0; s < dtau.length; s++) fit[s] = dm + (s - mean) * slope;\r\n\r\n  return { dtau: fit, rho: slope / SYM };\r\n}\r\n\r\nfunction smoothReal(src, bins) {\r\n  const n = bins.length;\r\n  const out = new Float64Array(src.length);\r\n  for (let i = 0; i < n; i++) {\r\n    let a = 0;\r\n    for (let t = -2; t <= 2; t++) {\r\n      let j = i + t;\r\n      if (j < 0) j = -j;\r\n      if (j >= n) j = 2 * (n - 1) - j;\r\n      a += src[bins[j]] * SMOOTH[t + 2];\r\n    }\r\n    out[bins[i]] = a / SMOOTH_SUM;\r\n  }\r\n  return out;\r\n}\r\n\r\n/**\r\n * 沿頻率方向平滑通道估計。\r\n *\r\n * 直接用 probe 平均出來的 H 噪音只比資料低 10·log10(PROBE_SYMS) dB，\r\n * 等化時又把它注回訊號，實測在 64QAM 吃掉約 1.8 dB。通道的延遲擴散遠小於\r\n * FFT 長度，H 在頻率上本來就平滑，所以可以再濾一次。\r\n *\r\n * 但不能直接濾：視窗刻意提早 WINDOW_ADVANCE 開始，加上前導的殘餘定時誤差，\r\n * 讓 H 帶著明顯的線性相位斜坡（每 bin 約 0.2 rad）。對稱濾波器碰到斜坡會\r\n * 保相位但縮振幅，造成約 7% 的增益偏差。所以先估出整體斜率、去旋轉、\r\n * 平滑、再轉回來。\r\n */\r\nfunction smoothChannel(hRe, hIm, bins) {\r\n  const n = bins.length;\r\n  if (n < 5) return;\r\n\r\n  let dr = 0, di = 0;\r\n  for (let i = 1; i < n; i++) {\r\n    if (bins[i] - bins[i - 1] !== 1) continue;\r\n    const a = i, b = i - 1;\r\n    dr += hRe[bins[a]] * hRe[bins[b]] + hIm[bins[a]] * hIm[bins[b]];\r\n    di += hIm[bins[a]] * hRe[bins[b]] - hRe[bins[a]] * hIm[bins[b]];\r\n  }\r\n  const slope = dr === 0 && di === 0 ? 0 : Math.atan2(di, dr);\r\n\r\n  const dRe = new Float64Array(n), dIm = new Float64Array(n);\r\n  for (let i = 0; i < n; i++) {\r\n    const k = bins[i];\r\n    const a = -slope * k;\r\n    const c = Math.cos(a), s = Math.sin(a);\r\n    dRe[i] = hRe[k] * c - hIm[k] * s;\r\n    dIm[i] = hRe[k] * s + hIm[k] * c;\r\n  }\r\n\r\n  const oRe = new Float64Array(n), oIm = new Float64Array(n);\r\n  for (let i = 0; i < n; i++) {\r\n    let ar = 0, ai = 0;\r\n    for (let t = -2; t <= 2; t++) {\r\n      let j = i + t;\r\n      if (j < 0) j = -j;\r\n      if (j >= n) j = 2 * (n - 1) - j;\r\n      const w = SMOOTH[t + 2];\r\n      ar += dRe[j] * w; ai += dIm[j] * w;\r\n    }\r\n    oRe[i] = ar / SMOOTH_SUM; oIm[i] = ai / SMOOTH_SUM;\r\n  }\r\n\r\n  for (let i = 0; i < n; i++) {\r\n    const k = bins[i];\r\n    const a = slope * k;\r\n    const c = Math.cos(a), s = Math.sin(a);\r\n    hRe[k] = oRe[i] * c - oIm[i] * s;\r\n    hIm[k] = oRe[i] * s + oIm[i] * c;\r\n  }\r\n}\r\n\r\n/**\r\n * 解調一段訊框。\r\n * @param {Float32Array} samples\r\n * @param {object} plan\r\n * @param {{symbols:number, payloadBytes?:number}} opts\r\n */\r\nfunction demodulate(samples, plan, opts) {\r\n  const { symbols } = opts;\r\n  if (!symbols) throw new Error('需要 opts.symbols');\r\n  // 要不要追時脈由呼叫端明講。\r\n  //\r\n  // 控制訊框（ACK、HELLO、READY）都只有十幾個符元、幾百毫秒 —— 就算兩端\r\n  // 石英差 100 ppm 也只漂不到一個 sample，完全不需要補償。但迴路不知道\r\n  // 訊框有多短，它會從雜訊裡硬估出時脈，實測被推到 ±1000 ppm 的上限\r\n  // （真值是個位數），星座整個轉掉、CRC 必定不過。\r\n  //\r\n  // 原本用 symbols >= 16 這個啟發式判斷，結果把 ACK 從 4 個符元加長到 16\r\n  // （為了重複三份）時，無聲地又把追蹤打開了 —— 症狀是相關峰 4400 卻\r\n  // 解出一堆亂碼。這種「改別的地方就悄悄改變行為」的耦合不該存在。\r\n  const trackClock = opts.trackClock ?? true;\r\n\r\n  const fft = makeFFT();\r\n  const chirp = opts.chirp ?? makeChirp(plan.spec.fLow, plan.spec.fHigh);\r\n  const sync = findPreamble(samples, chirp);\r\n  if (sync.index < 0 || sync.ratio < MIN_SYNC_RATIO) {\r\n    return { ok: false, reason: `同步失敗（ratio ${sync.ratio.toFixed(1)} < ${MIN_SYNC_RATIO}）`, sync };\r\n  }\r\n\r\n  const base = sync.index + PREAMBLE_LEN;\r\n  const re = new Float64Array(N), im = new Float64Array(N);\r\n\r\n  // ── 通道估計。前導的定時誤差在這裡被吸收進 H（表現為固定相位斜率），\r\n  //    因此後續只需追蹤「飄移」，不需要絕對定時精度。\r\n  //\r\n  //    但不能直接把幾個 probe 符元加起來平均：時脈差會讓它們彼此錯開，\r\n  //    500 ppm 下 4 個符元跨度就差 2.3 個 sample，在 k=469 相位差 6.6 rad，\r\n  //    盲目相加等於自我抵銷，高頻段的 H 會被抹平。\r\n  //    所以先量出每個 probe 相對第一個的定時差、去旋轉、再平均，\r\n  //    順便從這個差值的斜率取得時脈差的初值餵給後面的 PI 迴路。\r\n  const probe = probeSequence(plan);\r\n  const bins = plan.bins;\r\n  let hsRe = [], hsIm = [];\r\n\r\n  // 兩趟：第一趟用 step=1 粗估時脈差，第二趟帶著它重讀。\r\n  // 單趟不夠 —— 500 ppm 時單一 probe 符元內部就伸縮 0.5 個 sample，\r\n  // 這個 ICI 是 step 縮放才修得掉的，事後去旋轉補不回來。\r\n  let rho0 = 0;\r\n  for (let pass = 0; pass < 2; pass++) {\r\n    const step = 1 - rho0;\r\n    hsRe = []; hsIm = [];\r\n    for (let s = PROBE_SKIP; s < PROBE_SYMS; s++) {\r\n      const start = base + (s * SYM + CP - WINDOW_ADVANCE) * step;\r\n      fftAt(fft, samples, start, re, im, step);\r\n      const a = new Float64Array(N), b = new Float64Array(N);\r\n      bins.forEach((k, i) => {\r\n        const pr = probe.re[i], pi = probe.im[i];\r\n        a[k] = re[k] * pr + im[k] * pi;\r\n        b[k] = im[k] * pr - re[k] * pi;\r\n      });\r\n      hsRe.push(a); hsIm.push(b);\r\n    }\r\n    if (trackClock) rho0 = clampRho(rho0 + estimateProbeDrift(hsRe, hsIm, bins).rho);\r\n  }\r\n\r\n  const { dtau } = estimateProbeDrift(hsRe, hsIm, bins);\r\n\r\n  // 去旋轉後平均，同時用「各 probe 之間的離散程度」量出逐 bin 的雜訊 ——\r\n  // 這就是自適應 bit-loading 需要的東西，不必再另外送一次探測序列。\r\n  const hRe = new Float64Array(N), hIm = new Float64Array(N);\r\n  const alignRe = [], alignIm = [];\r\n  for (let s = 0; s < PROBE_USED; s++) {\r\n    const a = new Float64Array(N), b = new Float64Array(N);\r\n    for (const k of bins) {\r\n      const ang = (-2 * Math.PI * k * dtau[s]) / N;\r\n      const c = Math.cos(ang), sn = Math.sin(ang);\r\n      a[k] = hsRe[s][k] * c - hsIm[s][k] * sn;\r\n      b[k] = hsRe[s][k] * sn + hsIm[s][k] * c;\r\n      hRe[k] += a[k]; hIm[k] += b[k];\r\n    }\r\n    alignRe.push(a); alignIm.push(b);\r\n  }\r\n  for (const k of bins) { hRe[k] /= PROBE_USED; hIm[k] /= PROBE_USED; }\r\n\r\n  const rawNoise = new Float64Array(N);\r\n  for (const k of bins) {\r\n    let v = 0;\r\n    for (let s = 0; s < PROBE_USED; s++) {\r\n      const dr = alignRe[s][k] - hRe[k], di = alignIm[s][k] - hIm[k];\r\n      v += dr * dr + di * di;\r\n    }\r\n    rawNoise[k] = v / (PROBE_USED - 1);\r\n  }\r\n  // 只有 PROBE_SYMS−1 個自由度，方差估計本身很吵；沿頻率平滑一次\r\n  const noiseByBin = smoothReal(rawNoise, bins);\r\n\r\n  smoothChannel(hRe, hIm, plan.bins);\r\n\r\n  const weight = new Float64Array(N);\r\n  // 逐副載波 SNR：訊號功率要扣掉平均本身殘留的雜訊 (var/PROBE_SYMS)\r\n  const snrByBin = new Map();\r\n  for (const k of plan.bins) {\r\n    weight[k] = hRe[k] * hRe[k] + hIm[k] * hIm[k];\r\n    const nv = noiseByBin[k];\r\n    const sig = Math.max(weight[k] - nv / PROBE_USED, 0);\r\n    snrByBin.set(k, nv > 0 ? 10 * Math.log10(sig / nv) : -Infinity);\r\n  }\r\n\r\n  // ── 資料符元\r\n  const totalBits = symbols * plan.bitsPerSymbol;\r\n  const w = bitWriter(Math.ceil(totalBits / 8));\r\n  const write = w.write.bind(w);\r\n\r\n  const zRe = new Float64Array(N), zIm = new Float64Array(N);\r\n  const nP = plan.pilotBins.length;\r\n  const scratch = {\r\n    rawRe: new Float64Array(nP), rawIm: new Float64Array(nP),\r\n    smRe: new Float64Array(nP), smIm: new Float64Array(nP),\r\n    corrRe: new Float64Array(N), corrIm: new Float64Array(N),\r\n  };\r\n\r\n  // 時脈追蹤走 PI 迴路：\r\n  //   posOffset（比例項）吸收當下的定時誤差\r\n  //   rho（積分項）估計收發時脈的相對差，用來縮放取樣間距\r\n  //\r\n  // 只做整數視窗位移是不夠的 —— 那只修正「定時」，修不了「頻率縮放」。\r\n  // 時脈差 δ 會讓副載波間距也縮放 δ，在 k=469 造成 0.09 bin 的偏移，\r\n  // ICI 約 −15 dB，200 ppm 時就足以讓 16QAM 的 BER 停在 5e-3 下不去。\r\n  // 視窗位置用「遞增」推進，不是每次從 base 乘上 step 重算。\r\n  // 後者會讓積分項的迴路增益隨符元序號線性成長（s=100 時增益變成 4 倍），\r\n  // 必然震盪發散 —— 實測 rho 直接跑到 3000 ppm。\r\n  //\r\n  // 誤差動態：e[s+1] = (1−KP)e[s] + SYM·δ − u[s]，u[s+1] = u[s] + KI·e[s]\r\n  // 特徵方程 z² − (2−KP)z + (1−KP+KI)，KP=0.2/KI=0.02 時根為 0.9±0.1j，\r\n  // |z| = 0.906 < 1，時間常數約 10 個符元。\r\n  // 可從 opts 覆寫，供離線掃參數用（tools/loop-sweep.mjs）\r\n  const KP = trackClock ? (opts.kp ?? 0.20) : 0;\r\n  const KI = trackClock ? (opts.ki ?? 0.02) : 0;\r\n  let rho = rho0;\r\n  let pos = base + (PROBE_SYMS * SYM + CP - WINDOW_ADVANCE) * (1 - rho);\r\n  let noiseAcc = 0, noiseCnt = 0;\r\n  let lastTau = 0;\r\n\r\n  for (let s = 0; s < symbols; s++) {\r\n    const step = 1 - rho;\r\n    fftAt(fft, samples, pos, re, im, step);\r\n\r\n    for (const k of plan.bins) {\r\n      const d = weight[k];\r\n      if (d < 1e-20) { zRe[k] = 0; zIm[k] = 0; continue; }\r\n      zRe[k] = (re[k] * hRe[k] + im[k] * hIm[k]) / d;\r\n      zIm[k] = (im[k] * hRe[k] - re[k] * hIm[k]) / d;\r\n    }\r\n\r\n    const pilots = pilotSequence(plan, s);\r\n    const est = pilotCorrection(zRe, zIm, plan, pilots, scratch);\r\n    lastTau = est.tau;\r\n    noiseAcc += est.noiseVar; noiseCnt++;\r\n\r\n    for (const k of plan.bins) {\r\n      const cr = scratch.corrRe[k], ci = scratch.corrIm[k];\r\n      const rr = zRe[k] * cr - zIm[k] * ci;\r\n      const ii = zRe[k] * ci + zIm[k] * cr;\r\n      zRe[k] = rr; zIm[k] = ii;\r\n    }\r\n\r\n    for (const k of plan.dataBins) {\r\n      demapSymbol(zRe[k], zIm[k], plan.bitsByBin.get(k), write);\r\n    }\r\n\r\n    // τ > 0 表示視窗取晚了 → 位置往前拉，同時把時脈估計往上修。\r\n    // 迴路增益乘上相干度：估計不可信時自動凍結，而不是被噪音牽著走。\r\n    const g = est.coherence;\r\n    pos -= KP * g * lastTau;\r\n    rho = clampRho(rho + (KI * g * lastTau) / SYM);\r\n    pos += SYM * (1 - rho);\r\n  }\r\n\r\n  // 星座為單位平均功率，所以 SNR 就是 1/噪音方差\r\n  const noiseVar = noiseCnt ? noiseAcc / noiseCnt : Infinity;\r\n  return {\r\n    ok: true,\r\n    bytes: scramble(w.bytes),   // 就地解擾亂；XOR 自反，同一張表兩用\r\n\r\n    sync,\r\n    noiseVar,\r\n    snrDb: noiseVar > 0 ? -10 * Math.log10(noiseVar) : Infinity,\r\n    driftSamples: lastTau,\r\n    rhoPpm: rho * 1e6,\r\n    residTau: lastTau,\r\n    snrByBin,\r\n  };\r\n}\n\n// ═══ ../src/dsp/sha256.js ══════════════════════════════════════\n// 純 JS SHA-256。\n//\n// 不用 crypto.subtle 是因為它是非同步的、而且與 Node 的介面不同；\n// 自己實作可讓瀏覽器、Node 測試、離線工具跑完全同一份程式碼，\n// 也讓打包後的單檔不依賴任何平台 API。\n\nconst K = new Uint32Array([\n  0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,\n  0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,\n  0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,\n  0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,\n  0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,\n  0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,\n  0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,\n  0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,\n]);\n\nconst rotr = (x, n) => ((x >>> n) | (x << (32 - n))) >>> 0;\n\nfunction sha256(bytes) {\n  const h = new Uint32Array([\n    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,\n  ]);\n\n  const bitLen = bytes.length * 8;\n  const padded = new Uint8Array((((bytes.length + 9) >> 6) + 1) << 6);\n  padded.set(bytes);\n  padded[bytes.length] = 0x80;\n  // 長度為 64-bit big-endian；JS 位元運算只有 32 bit，高位用除法取\n  const hi = Math.floor(bitLen / 0x100000000);\n  const view = new DataView(padded.buffer);\n  view.setUint32(padded.length - 8, hi, false);\n  view.setUint32(padded.length - 4, bitLen >>> 0, false);\n\n  const w = new Uint32Array(64);\n  for (let off = 0; off < padded.length; off += 64) {\n    for (let i = 0; i < 16; i++) w[i] = view.getUint32(off + i * 4, false);\n    for (let i = 16; i < 64; i++) {\n      const s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >>> 3);\n      const s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >>> 10);\n      w[i] = (w[i - 16] + s0 + w[i - 7] + s1) >>> 0;\n    }\n    let [a, b, c, d, e, f, g, hh] = h;\n    for (let i = 0; i < 64; i++) {\n      const S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);\n      const ch = (e & f) ^ (~e & g);\n      const t1 = (hh + S1 + ch + K[i] + w[i]) >>> 0;\n      const S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);\n      const maj = (a & b) ^ (a & c) ^ (b & c);\n      const t2 = (S0 + maj) >>> 0;\n      hh = g; g = f; f = e; e = (d + t1) >>> 0;\n      d = c; c = b; b = a; a = (t1 + t2) >>> 0;\n    }\n    h[0] = (h[0] + a) >>> 0; h[1] = (h[1] + b) >>> 0; h[2] = (h[2] + c) >>> 0; h[3] = (h[3] + d) >>> 0;\n    h[4] = (h[4] + e) >>> 0; h[5] = (h[5] + f) >>> 0; h[6] = (h[6] + g) >>> 0; h[7] = (h[7] + hh) >>> 0;\n  }\n\n  const out = new Uint8Array(32);\n  new DataView(out.buffer).setUint32(0, h[0], false);\n  for (let i = 0; i < 8; i++) new DataView(out.buffer).setUint32(i * 4, h[i], false);\n  return out;\n}\n\nconst hex = (b) => [...b].map((v) => v.toString(16).padStart(2, '0')).join('');\n\n// ═══ ../src/fountain/packet.js ═════════════════════════════════\n// 傳輸封包格式與 CRC。\n//\n// 架構決定：不另外做 FEC（LDPC 之類），改成「CRC 偵錯 → 丟棄壞封包 →\n// 交給噴泉碼補」。這把位元錯誤通道轉成抹除通道，而噴泉碼本來就是為抹除\n// 設計的。少一層編解碼、少一組參數要調，代價只是壞封包的頻寬白費。\n//\n//   封包 = [ seed:3 | payload:P | CRC-16:2 ]\n//\n// seed 決定這個封包混了哪幾塊（收發用同一個 PRNG 推導），所以不必帶索引清單。\n// seed = 0xFFFFFF 保留給 manifest。\n\nconst SEED_BYTES = 3;\nconst CRC_BYTES = 2;\nconst OVERHEAD = SEED_BYTES + CRC_BYTES;\nconst MANIFEST_SEED = 0xffffff;\n\n// CRC-16/CCITT-FALSE。查表版，位元組序處理一次算好。\nconst CRC_TABLE = (() => {\n  const t = new Uint16Array(256);\n  for (let i = 0; i < 256; i++) {\n    let c = i << 8;\n    for (let j = 0; j < 8; j++) c = (c & 0x8000) ? ((c << 1) ^ 0x1021) & 0xffff : (c << 1) & 0xffff;\n    t[i] = c;\n  }\n  return t;\n})();\n\nfunction crc16(bytes, from = 0, to = bytes.length) {\n  let c = 0xffff;\n  for (let i = from; i < to; i++) c = ((c << 8) & 0xffff) ^ CRC_TABLE[((c >> 8) ^ bytes[i]) & 0xff];\n  return c;\n}\n\nfunction packetSize(payloadSize) {\n  return payloadSize + OVERHEAD;\n}\n\nfunction writePacket(out, offset, seed, payload) {\n  out[offset] = (seed >> 16) & 0xff;\n  out[offset + 1] = (seed >> 8) & 0xff;\n  out[offset + 2] = seed & 0xff;\n  out.set(payload, offset + SEED_BYTES);\n  const end = offset + SEED_BYTES + payload.length;\n  const c = crc16(out, offset, end);\n  out[end] = (c >> 8) & 0xff;\n  out[end + 1] = c & 0xff;\n  return end + CRC_BYTES;\n}\n\n/**\n * @returns {{seed:number, payload:Uint8Array}|null} CRC 不符時回 null\n */\nfunction readPacket(buf, offset, payloadSize) {\n  const end = offset + SEED_BYTES + payloadSize;\n  if (end + CRC_BYTES > buf.length) return null;\n  const want = (buf[end] << 8) | buf[end + 1];\n  if (crc16(buf, offset, end) !== want) return null;\n  return {\n    seed: (buf[offset] << 16) | (buf[offset + 1] << 8) | buf[offset + 2],\n    payload: buf.subarray(offset + SEED_BYTES, end),\n  };\n}\n\n/**\n * 依照 plan 每符元能載多少 bit，決定封包要跨幾個符元。\n *\n * 太小則 5 bytes 的表頭佔比失控；太大則單一位元錯就報銷一大塊頻寬\n * （BER 3e-4 時，200 bytes 的封包有 38% 機率壞掉，60 bytes 只有 13%）。\n * 對齊到符元邊界，讓某個符元的突發錯誤只波及一個封包。\n */\nfunction choosePacketLayout(bitsPerSymbol, targetBytes = 96) {\n  const bytesPerSymbol = bitsPerSymbol / 8;\n  const symbols = Math.max(1, Math.round(targetBytes / bytesPerSymbol));\n  const totalBytes = Math.floor((symbols * bitsPerSymbol) / 8);\n  const payloadSize = totalBytes - OVERHEAD;\n  if (payloadSize < 8) {\n    // 每符元載得太少，加符元數直到裝得下有意義的內容\n    return choosePacketLayout(bitsPerSymbol, targetBytes * 2);\n  }\n  return { symbols, totalBytes, payloadSize, bitsUsed: totalBytes * 8 };\n}\n\n// ═══ ../src/transfer/ack.js ════════════════════════════════════\n// 反向鏈路的回報（ACK）。\r\n//\r\n// 兩台裝置距離只有 2–3 cm，不可能同時收發 —— 自己喇叭的輸出會直接蓋掉\r\n// 自己的麥克風。所以走半雙工：發送端每隔幾個訊框留一個「聽窗」，\r\n// 接收端在那個窗裡送回報。\r\n//\r\n// 回報訊號用「反向 chirp」（22→18 kHz）而不是資料訊框的正向 chirp：\r\n// 兩者的匹配濾波幾乎不互相響應，發送端不會把自己的回音誤認成 ACK，\r\n// 接收端也不會把發送端的訊框誤認成回報。\r\n//\r\n//   [ 反向 chirp | guard | probe ×5 | 資料符元 ×4 ]  ≈ 312 ms\r\n//\r\n// 內容刻意做小：只要讓發送端知道「哪些段還缺」就夠了。\r\n// 同一份內容送三遍，各自帶 CRC，收端先試各份、再對位元做多數決。\r\n//\r\n// 回報是單一的 CRC 區塊 —— 錯一個 bit 就整包作廢，這跟資料訊框很不一樣\r\n// （資料有噴泉碼，掉幾個封包無所謂）。而實機上回報的解調 SNR 只有 5 dB\r\n// 左右（離線是 37 dB），BPSK 在那個位準的 BER 約 1e-2，一份必錯。\r\n//\r\n// 三份的位元落在不同的副載波上（32 bytes = 256 bits 不是每符元 59 bits\r\n// 的整數倍），所以固定壞掉的 bin 不會打中同一個位元位置 —— 多數決能把\r\n// 1e-2 的位元錯誤壓到 3e-4 量級。代價是訊框 0.41 → 0.60 s，聽窗 1.2 s 裝得下。\r\n// 實測 3 送 3 收。\r\n// 三份而不是四份：16 個符元裝得下 118 bytes，四份要 128 塞不進去，\r\n// 而三份的多數決本來就沒有平手問題 —— 偶數份反而要多一條裁決規則。\r\nconst ACK_COPIES = 3;\r\nconst ACK_SYMBOLS = 16;\r\nconst ACK_BITS = 1;                    // BPSK：回報必須比資料更禁得起雜訊\r\nconst BITMAP_SEGMENTS = 128;           // 從 firstNeeded 起算，涵蓋這麼多段\r\nconst BITMAP_BYTES = BITMAP_SEGMENTS / 8;\r\n\r\n//   [ magic:2 \"AK\" | hash8:8 | flags:1 | firstNeeded:3 | bitmap:16 | crc:2 ] = 32 bytes\r\nconst ACK_MAGIC = 0x414b;\r\nconst ACK_PAYLOAD_BYTES = 2 + 8 + 1 + 3 + BITMAP_BYTES + 2;\r\n\r\nfunction ackPlan(band) {\r\n  return makePlan({ band, fallbackBits: ACK_BITS });\r\n}\r\n\r\nfunction ackFrameSamples(band) {\r\n  return PREAMBLE_LEN + (PROBE_SYMS + ACK_SYMBOLS) * SYM;\r\n}\r\n\r\n// 反向掃頻：makeChirp 的斜率由參數順序決定，把高低頻對調即得\r\nconst reverseChirp = (plan) => makeChirp(plan.spec.fHigh, plan.spec.fLow);\r\n\r\n/**\r\n * @param {{hash8:Uint8Array, done:boolean, needed:number[]}} s\r\n *        needed 為「還缺的段號」清單\r\n */\r\nfunction encodeAck({ hash8, done, needed }) {\r\n  const out = new Uint8Array(ACK_PAYLOAD_BYTES);\r\n  out[0] = (ACK_MAGIC >> 8) & 0xff; out[1] = ACK_MAGIC & 0xff;\r\n  out.set(hash8.subarray(0, 8), 2);\r\n  out[10] = done ? 1 : 0;\r\n  const first = needed.length ? Math.min(...needed) : 0;\r\n  out[11] = (first >> 16) & 0xff; out[12] = (first >> 8) & 0xff; out[13] = first & 0xff;\r\n  for (const seg of needed) {\r\n    const rel = seg - first;\r\n    if (rel >= 0 && rel < BITMAP_SEGMENTS) out[14 + (rel >> 3)] |= 1 << (rel & 7);\r\n  }\r\n  const c = crc16(out, 0, ACK_PAYLOAD_BYTES - 2);\r\n  out[ACK_PAYLOAD_BYTES - 2] = (c >> 8) & 0xff;\r\n  out[ACK_PAYLOAD_BYTES - 1] = c & 0xff;\r\n  return out;\r\n}\r\n\r\nfunction decodeAck(buf) {\r\n  if (buf.length < ACK_PAYLOAD_BYTES) return null;\r\n  if (((buf[0] << 8) | buf[1]) !== ACK_MAGIC) return null;\r\n  const want = (buf[ACK_PAYLOAD_BYTES - 2] << 8) | buf[ACK_PAYLOAD_BYTES - 1];\r\n  if (crc16(buf, 0, ACK_PAYLOAD_BYTES - 2) !== want) return null;\r\n  const first = (buf[11] << 16) | (buf[12] << 8) | buf[13];\r\n  const needed = [];\r\n  for (let i = 0; i < BITMAP_SEGMENTS; i++) {\r\n    if (buf[14 + (i >> 3)] & (1 << (i & 7))) needed.push(first + i);\r\n  }\r\n  return { hash8: buf.slice(2, 10), done: buf[10] === 1, first, needed };\r\n}\r\n\r\n/** 產生一段回報音訊 */\r\nfunction modulateAck(band, payload) {\r\n  const plan = ackPlan(band);\r\n  const bytesPerFrame = Math.floor((ACK_SYMBOLS * plan.bitsPerSymbol) / 8);\r\n  const buf = new Uint8Array(bytesPerFrame);\r\n  for (let c = 0; c < ACK_COPIES; c++) {\r\n    const off = c * ACK_PAYLOAD_BYTES;\r\n    if (off + ACK_PAYLOAD_BYTES > bytesPerFrame) break;\r\n    buf.set(payload, off);\r\n  }\r\n  return modulate(buf, plan, { chirp: reverseChirp(plan) }).samples;\r\n}\r\n\r\n/**\r\n * 在一段錄音裡找回報訊號。\r\n * @returns {{ack:object, index:number, ratio:number}|null}\r\n */\r\nfunction findAck(samples, band, minRatio = 8) {\r\n  const plan = ackPlan(band);\r\n  const chirp = reverseChirp(plan);\r\n  const sync = findPreamble(samples, chirp);\r\n  if (sync.index < 0 || sync.ratio < minRatio) return null;\r\n\r\n  const need = ackFrameSamples(band);\r\n  if (samples.length - sync.index < need) return null;\r\n\r\n  let r;\r\n  try {\r\n    r = demodulate(samples.subarray(sync.index, Math.min(samples.length, sync.index + need + SYM)), plan,\r\n      { symbols: ACK_SYMBOLS, chirp, trackClock: false });\r\n  } catch { return null; }\r\n  if (!r.ok) return null;\r\n\r\n  const copies = [];\r\n  for (let c = 0; c < ACK_COPIES; c++) {\r\n    const off = c * ACK_PAYLOAD_BYTES;\r\n    if (off + ACK_PAYLOAD_BYTES > r.bytes.length) break;\r\n    const view = r.bytes.subarray(off, off + ACK_PAYLOAD_BYTES);\r\n    const ack = decodeAck(view);\r\n    if (ack) return { ack, index: sync.index, ratio: sync.ratio, copy: c };\r\n    copies.push(view);\r\n  }\r\n\r\n  // 每一份都沒過，就對位元做多數決再試一次。\r\n  // 錯的位元散在各份的不同位置，多數決能救回單份救不回來的情況。\r\n  if (copies.length < 3) return null;\r\n  const merged = new Uint8Array(ACK_PAYLOAD_BYTES);\r\n  for (let i = 0; i < ACK_PAYLOAD_BYTES; i++) {\r\n    let v = 0;\r\n    for (let b = 0; b < 8; b++) {\r\n      let ones = 0;\r\n      for (const c of copies) ones += (c[i] >> b) & 1;\r\n      if (ones * 2 > copies.length) v |= 1 << b;\r\n    }\r\n    merged[i] = v;\r\n  }\r\n  const ack = decodeAck(merged);\r\n  return ack ? { ack, index: sync.index, ratio: sync.ratio, copy: -1 } : null;\r\n}\n\n// ═══ ../src/transfer/handshake.js ══════════════════════════════\n// 傳送前的交握。\r\n//\r\n// 原本是「發送端自己選調變、直接開始送」，接收端再從兩種候選裡猜。這有三個\r\n// 代價：猜錯就整場報廢；每個副載波被迫用同一種調變，而實測逐 bin 的 SNR\r\n// 差到 13 dB；接收端手上已經有的段，發送端要等好幾個訊框後的 ACK 才知道。\r\n//\r\n// 交握把這三件事一次談完：\r\n//\r\n//   發送端 ──HELLO──▶  檔案雜湊、大小、分段幾何\r\n//   接收端 ──READY──▶  我已經有哪幾段、各副載波你該用幾個 bit\r\n//   發送端            照著談好的配置開始送\r\n//\r\n// HELLO 走正向 chirp、READY 走反向 chirp，跟資料訊框與 ACK 共用同一套實體層。\r\n// 兩者都用 BPSK 打滿整個頻段 —— 交握本身不能依賴還沒談成的參數。\r\n//\r\n// 談不成也要能跑：發送端試幾次收不到 READY 就退回原本的固定調變，\r\n// 接收端則永遠把「談好的配置」和原本的 qpsk/bpsk 一起當候選，\r\n// 用 CRC 通過數決定採用哪一個。任何一邊的交握失敗都只是回到舊行為。\r\nconst HELLO_MAGIC = 0x5748;      // \"WH\"\r\nconst READY_MAGIC = 0x5752;      // \"WR\"\r\n\r\n// 符元數要讓「三份都塞得下」。HELLO 酬載 27 bytes，三份 81 bytes，\r\n// BPSK 打滿 stealth 是 59 bits/符元 → 至少 11 個，取 12 留餘裕。\r\n// 塞不下三份就沒有多數決可做，只能逐份試 CRC —— 實測 10 dB 時\r\n// 成功率從 8/8 掉到 7/8，而交握失敗的代價是整場退回舊行為。\r\nconst HELLO_SYMBOLS = 12;\r\nconst READY_SYMBOLS = 14;\r\n\r\n// 配置表以「連續 4 個候選 bin」為一組。逐 bin 要 59×3=177 bits，\r\n// 而實測的通道曲線在相鄰 bin 之間差不到 1 dB —— 分組幾乎不損失什麼，\r\n// 表卻從 23 bytes 縮到 6 bytes，重複三份也塞得下一個短訊框。\r\nconst BIT_GROUP = 4;\r\n// 3 bits 一組，索引這五個階數（0 代表這組 bin 不用）\r\nconst LADDER5 = [0, 1, 2, 4, 6];\r\n\r\nconst HELLO_BYTES = 2 + 8 + 6 + 3 + 6 + 2;        // magic hash8 fileSize segCount perSeg crc\r\nconst READY_FIXED = 2 + 8 + 1 + 3 + 4 + 1;        // magic hash8 flags haveFirst haveBitmap groups\r\nconst HAVE_SEGMENTS = 32;                          // haveBitmap 涵蓋的段數\r\nconst READY_COPIES = 3;\r\n\r\nconst helloPlan = (band) => makePlan({ band, fallbackBits: 1 });\r\nconst helloChirp = (plan) => makeChirp(plan.spec.fLow, plan.spec.fHigh);\r\nconst readyChirp = (plan) => makeChirp(plan.spec.fHigh, plan.spec.fLow);\r\n\r\nconst helloFrameSamples = () => PREAMBLE_LEN + (PROBE_SYMS + HELLO_SYMBOLS) * SYM;\r\nconst readyFrameSamples = () => PREAMBLE_LEN + (PROBE_SYMS + READY_SYMBOLS) * SYM;\r\n\r\nfunction groupCount(band) {\r\n  return Math.ceil(bandBins(band).candidates.length / BIT_GROUP);\r\n}\r\nconst tableBytes = (band) => Math.ceil((groupCount(band) * 3) / 8);\r\nconst readyPayloadBytes = (band) => READY_FIXED + tableBytes(band) + 2;\r\n\r\n// 這幾個位元組小工具跟 manifest.js 的同名函式參數順序不同（那邊是 (offset, array, value)），\r\n// 刻意不共用也刻意不同名 —— 打包是攤平到同一個作用域，同名會直接 SyntaxError\r\nconst put24 = (a, o, v) => { a[o] = (v >> 16) & 0xff; a[o + 1] = (v >> 8) & 0xff; a[o + 2] = v & 0xff; };\r\nconst get24 = (a, o) => (a[o] << 16) | (a[o + 1] << 8) | a[o + 2];\r\nconst put48 = (a, o, v) => {\r\n  const hi = Math.floor(v / 0x100000000);\r\n  a[o] = (hi >> 8) & 0xff; a[o + 1] = hi & 0xff;\r\n  const lo = v >>> 0;\r\n  a[o + 2] = (lo >>> 24) & 0xff; a[o + 3] = (lo >>> 16) & 0xff;\r\n  a[o + 4] = (lo >>> 8) & 0xff; a[o + 5] = lo & 0xff;\r\n};\r\nconst get48 = (a, o) => ((a[o] << 8) | a[o + 1]) * 0x100000000 +\r\n  (((a[o + 2] << 24) >>> 0) + (a[o + 3] << 16) + (a[o + 4] << 8) + a[o + 5]);\r\n\r\nconst seal = (a) => { const c = crc16(a, 0, a.length - 2); a[a.length - 2] = (c >> 8) & 0xff; a[a.length - 1] = c & 0xff; return a; };\r\nconst checked = (a, magic) => {\r\n  if (a.length < 4 || ((a[0] << 8) | a[1]) !== magic) return false;\r\n  return crc16(a, 0, a.length - 2) === ((a[a.length - 2] << 8) | a[a.length - 1]);\r\n};\r\n\r\n// ---------------------------------------------------------------- HELLO\r\n\r\nfunction encodeHello({ hash8, fileSize, segCount, perSeg }) {\r\n  const a = new Uint8Array(HELLO_BYTES);\r\n  a[0] = HELLO_MAGIC >> 8; a[1] = HELLO_MAGIC & 0xff;\r\n  a.set(hash8.subarray(0, 8), 2);\r\n  put48(a, 10, fileSize);\r\n  put24(a, 16, segCount);\r\n  put48(a, 19, perSeg);\r\n  return seal(a);\r\n}\r\n\r\nfunction decodeHello(a) {\r\n  if (!checked(a.subarray(0, HELLO_BYTES), HELLO_MAGIC)) return null;\r\n  const fileSize = get48(a, 10), segCount = get24(a, 16), perSeg = get48(a, 19);\r\n  if (fileSize <= 0 || segCount <= 0 || perSeg <= 0) return null;\r\n  return { hash8: a.slice(2, 10), fileSize, segCount, perSeg };\r\n}\r\n\r\n// ---------------------------------------------------------------- 配置表\r\n\r\n/** 依實測 SNR 決定每一組要用幾個 bit（margin 是額外保留的裕度） */\r\nfunction packBitsTable(band, snrByBin, marginDb = 3, maxBits = MAX_BITS) {\r\n  const { candidates } = bandBins(band);\r\n  const n = groupCount(band);\r\n  const out = new Uint8Array(tableBytes(band));\r\n  for (let g = 0; g < n; g++) {\r\n    // 一組裡取最差的那個 bin —— 同一組共用階數，遷就最弱的才不會整組錯\r\n    let worst = Infinity;\r\n    for (let i = g * BIT_GROUP; i < Math.min(candidates.length, (g + 1) * BIT_GROUP); i++) {\r\n      const v = snrByBin?.get(candidates[i]);\r\n      worst = Math.min(worst, Number.isFinite(v) ? v : -Infinity);\r\n    }\r\n    const bits = bitsForSnr(worst - marginDb, maxBits);\r\n    const code = Math.max(0, LADDER5.indexOf(bits));\r\n    const bit = g * 3;\r\n    // 3 bits 可能跨位元組\r\n    out[bit >> 3] |= (code << 5) >> (bit & 7);\r\n    if ((bit & 7) > 5) out[(bit >> 3) + 1] |= (code << (13 - (bit & 7))) & 0xff;\r\n  }\r\n  return out;\r\n}\r\n\r\n/** 攤平成 makePlan 要的「每個候選 bin 幾個 bit」陣列 */\r\nfunction unpackBitsTable(band, packed) {\r\n  const { candidates } = bandBins(band);\r\n  const n = groupCount(band);\r\n  const out = new Uint8Array(candidates.length);\r\n  for (let g = 0; g < n; g++) {\r\n    const bit = g * 3;\r\n    let code = (packed[bit >> 3] << (bit & 7)) & 0xff;\r\n    if ((bit & 7) > 5) code |= packed[(bit >> 3) + 1] >> (8 - (bit & 7));\r\n    code >>= 5;\r\n    const bits = LADDER5[code] ?? 0;\r\n    for (let i = g * BIT_GROUP; i < Math.min(candidates.length, (g + 1) * BIT_GROUP); i++) out[i] = bits;\r\n  }\r\n  return out;\r\n}\r\n\r\n// ---------------------------------------------------------------- READY\r\n\r\nfunction encodeReady({ band, hash8, have = [], table, refuse = false }) {\r\n  const a = new Uint8Array(readyPayloadBytes(band));\r\n  a[0] = READY_MAGIC >> 8; a[1] = READY_MAGIC & 0xff;\r\n  a.set(hash8.subarray(0, 8), 2);\r\n  a[10] = refuse ? 1 : 0;\r\n  const first = have.length ? Math.min(...have) : 0;\r\n  put24(a, 11, first);\r\n  for (const s of have) {\r\n    const rel = s - first;\r\n    if (rel >= 0 && rel < HAVE_SEGMENTS) a[14 + (rel >> 3)] |= 1 << (rel & 7);\r\n  }\r\n  a[18] = groupCount(band);\r\n  a.set(table.subarray(0, tableBytes(band)), 19);\r\n  return seal(a);\r\n}\r\n\r\nfunction decodeReady(band, a) {\r\n  const need = readyPayloadBytes(band);\r\n  if (a.length < need || !checked(a.subarray(0, need), READY_MAGIC)) return null;\r\n  if (a[18] !== groupCount(band)) return null;      // 兩端的頻段設定不一致\r\n  const first = get24(a, 11);\r\n  const have = [];\r\n  for (let i = 0; i < HAVE_SEGMENTS; i++) if (a[14 + (i >> 3)] & (1 << (i & 7))) have.push(first + i);\r\n  return { hash8: a.slice(2, 10), refuse: a[10] === 1, have, table: a.slice(19, 19 + tableBytes(band)) };\r\n}\r\n\r\n// ---------------------------------------------------------------- 實體層\r\n\r\nfunction modulateMsg(plan, chirp, symbols, payload, copies) {\r\n  const bytesPerFrame = Math.floor((symbols * plan.bitsPerSymbol) / 8);\r\n  const buf = new Uint8Array(bytesPerFrame);\r\n  for (let c = 0; c < copies; c++) {\r\n    const off = c * payload.length;\r\n    if (off + payload.length > bytesPerFrame) break;\r\n    buf.set(payload, off);\r\n  }\r\n  return modulate(buf, plan, { chirp }).samples;\r\n}\r\n\r\n/**\r\n * 從訊框裡取出訊息：先逐份試 CRC，都不過就對位元做多數決。\r\n * 跟 ACK 用同一招 —— 實機上這種短訊框的解調 SNR 只有 5 dB 左右。\r\n */\r\nfunction extract(bytes, size, copies, decode) {\r\n  const views = [];\r\n  for (let c = 0; c < copies; c++) {\r\n    const off = c * size;\r\n    if (off + size > bytes.length) break;\r\n    const v = bytes.subarray(off, off + size);\r\n    const got = decode(v);\r\n    if (got) return got;\r\n    views.push(v);\r\n  }\r\n  if (views.length < 3) return null;\r\n  const merged = new Uint8Array(size);\r\n  for (let i = 0; i < size; i++) {\r\n    let v = 0;\r\n    for (let b = 0; b < 8; b++) {\r\n      let ones = 0;\r\n      for (const c of views) ones += (c[i] >> b) & 1;\r\n      if (ones * 2 > views.length) v |= 1 << b;\r\n    }\r\n    merged[i] = v;\r\n  }\r\n  return decode(merged);\r\n}\r\n\r\nfunction modulateHello(band, payload) {\r\n  const plan = helloPlan(band);\r\n  return modulateMsg(plan, helloChirp(plan), HELLO_SYMBOLS, payload, READY_COPIES);\r\n}\r\n\r\nfunction modulateReady(band, payload) {\r\n  const plan = helloPlan(band);\r\n  return modulateMsg(plan, readyChirp(plan), READY_SYMBOLS, payload, READY_COPIES);\r\n}\r\n\r\nfunction findMsg(samples, band, chirpOf, symbols, need, minRatio, size, decode) {\r\n  const plan = helloPlan(band);\r\n  const chirp = chirpOf(plan);\r\n  // 緩衝是滾動的，最新的那個交握訊框往往才錄到一半 —— 它的相關峰卻是最強的，\r\n  // 挑到它就等於挑到一個註定解不開的位置，而且會蓋掉前一個完整的訊框。\r\n  // 實測相關峰 3945（門檻 8）卻一次都解不出來。\r\n  //\r\n  // 不能用 findPreamble 的 searchLen 去夾 —— 那限制的是「參與相關的訊號範圍」\r\n  // 而不是「可接受的峰值位置」，會把 chirp 本身切斷。改成找到之後檢查尾巴，\r\n  // 不夠就在它前面重找一次。\r\n  let sync = findPreamble(samples, chirp);\r\n  if (sync.index >= 0 && samples.length - sync.index < need) {\r\n    if (sync.index <= chirp.length) return null;\r\n    sync = findPreamble(samples.subarray(0, sync.index), chirp);\r\n  }\r\n  if (sync.index < 0 || sync.ratio < minRatio) return null;\r\n  if (samples.length - sync.index < need) return null;\r\n  // 多切一個符元的餘裕。\r\n  //\r\n  // 切剛好等於訊框長度時，離線沒事（訊框位置是精確的），實機必定失敗：\r\n  // 相關峰的定時解析度只有幾個 sample，切點會落在訊框開始前一點點，\r\n  // demodulate 內部重新同步之後就少了那幾個 sample，直接回 ok=false。\r\n  // 症狀是「相關峰 4638、卻一次都解不開」。\r\n  const end = Math.min(samples.length, sync.index + need + SYM);\r\n  let r;\r\n  try { r = demodulate(samples.subarray(sync.index, end), plan, { symbols, chirp, trackClock: false }); } catch { return null; }\r\n  if (!r.ok) return null;\r\n  const got = extract(r.bytes, size, READY_COPIES, decode);\r\n  // snrByBin 一併帶出去：HELLO 的 probe 符元就是通道量測本身，\r\n  // 接收端要靠它決定回報的位元配置，沒必要再解一次\r\n  return got ? { msg: got, index: sync.index, ratio: sync.ratio, snrByBin: r.snrByBin } : null;\r\n}\r\n\r\nfunction findHello(samples, band, minRatio = 8) {\r\n  return findMsg(samples, band, helloChirp, HELLO_SYMBOLS, helloFrameSamples(),\r\n    minRatio, HELLO_BYTES, decodeHello);\r\n}\r\n\r\nfunction findReady(samples, band, minRatio = 8) {\r\n  return findMsg(samples, band, readyChirp, READY_SYMBOLS, readyFrameSamples(),\r\n    minRatio, readyPayloadBytes(band), (a) => decodeReady(band, a));\r\n}\n// 三種搜尋共用一顆 Worker，用 mode 分派：\n//   hello — 接收端等交握，順手把量到的通道換算成要回報的位元配置\n//   ready — 發送端等交握回覆\n//   ack   — 傳輸中的例行回報\n// 每一種都回報「不管門檻的相關峰值」：找不到東西時，這個數字能分辨\n// 「緩衝裡根本沒有訊號」和「訊號在但內容解不開」，兩者的下一步完全不同。\nself.onmessage = (e) => {\n  const { buf, band, id, mode, marginDb } = e.data;\n  const x = new Float32Array(buf);\n  let found = null, ratio = 0, index = -1, why = null;\n  try {\n    if (mode === 'hello') {\n      const hp = helloPlan(band);\n      const pk = findPreamble(x, helloChirp(hp));\n      ratio = pk.ratio; index = pk.index;\n      const g = findHello(x, band);\n      if (g) {\n        found = { hello: g.msg, table: packBitsTable(band, g.snrByBin, marginDb), medianSnr: median(g.snrByBin) };\n        index = g.index;\n      } else if (ratio > 40) {\n        why = explain(x, index, helloFrameSamples(), hp, HELLO_SYMBOLS, helloChirp(hp));\n      }\n    } else if (mode === 'ready') {\n      const hp = helloPlan(band);\n      const pk = findPreamble(x, readyChirp(hp));\n      ratio = pk.ratio; index = pk.index;\n      const g = findReady(x, band);\n      if (g) { found = { ready: g.msg }; index = g.index; }\n      else if (ratio > 40) why = explain(x, index, readyFrameSamples(), hp, READY_SYMBOLS, readyChirp(hp));\n    } else {\n      const plan = ackPlan(band);\n      const pk = findPreamble(x, reverseChirp(plan));\n      ratio = pk.ratio; index = pk.index;\n      const g = findAck(x, band);\n      if (g) found = { ack: g.ack, ratio: g.ratio };\n      else if (ratio > 40) why = explain(x, index, ackFrameSamples(band), plan, ACK_SYMBOLS, reverseChirp(plan));\n    }\n  } catch (err) { why = 'throw:' + (err && err.message ? err.message : err); }\n  self.postMessage({ id, mode, ratio, index, why, sec: x.length / 48000, found });\n};\n\nfunction explain(x, index, need, plan, symbols, chirp) {\n  if (index < 0) return 'no-peak';\n  if (x.length - index < need) return 'tail:' + (x.length - index) + '/' + need;\n  const r = demodulate(x.subarray(index, Math.min(x.length, index + need + 1152)), plan, { symbols, chirp });\n  if (!r.ok) return 'demod:' + (r.reason || '?');\n  return 'crc snr=' + r.snrDb.toFixed(1) + ' head=' + [...r.bytes.slice(0, 6)].join('.');\n}\n\nfunction median(m) {\n  const v = [...m.values()].filter(Number.isFinite).sort((a, b) => a - b);\n  return v.length ? v[v.length >> 1] : null;\n}\n";
 
 // ═══ ../src/dsp/fft.js ═════════════════════════════════════════
 // 就地 radix-2 FFT，預先計算 twiddle 表以避免遞推累積誤差。
@@ -453,13 +453,16 @@ function bitsForSnr(snrDb, maxBits = MAX_BITS) {
  * @param {number} opts.fallbackBits  沒有量測資料時的保守預設
  * @param {number} opts.maxBits
  */
-function makePlan({ band = 'turbo', snrByBin = null, fallbackBits = 2, maxBits = MAX_BITS } = {}) {
+/**
+ * 頻段的骨架：有哪些 bin、哪些當 pilot、剩下哪些可以載資料。
+ * 抽出來是因為「配置表」的索引必須兩端一致 —— 表裡的第 i 個項目對應
+ * candidates[i]，這個對應關係只能有一個定義。
+ */
+function bandBins(band) {
   const spec = BANDS[band];
   if (!spec) throw new Error(`unknown band: ${band}`);
-
   const binLow = Math.max(1, Math.ceil(spec.fLow / BIN_HZ));
   const binHigh = Math.min(N / 2 - 1, Math.floor(spec.fHigh / BIN_HZ));
-
   const bins = [];
   for (let k = binLow; k <= binHigh; k++) bins.push(k);
 
@@ -468,15 +471,29 @@ function makePlan({ band = 'turbo', snrByBin = null, fallbackBits = 2, maxBits =
   for (let i = 0; i < bins.length; i += PILOT_SPACING) pilotSet.add(bins[i]);
   pilotSet.add(bins[bins.length - 1]);
 
-  const pilotBins = bins.filter((k) => pilotSet.has(k));
+  return {
+    spec, binLow, binHigh, bins, pilotSet,
+    pilotBins: bins.filter((k) => pilotSet.has(k)),
+    candidates: bins.filter((k) => !pilotSet.has(k)),
+  };
+}
+
+function makePlan({ band = 'turbo', snrByBin = null, bitsTable = null,
+  fallbackBits = 2, maxBits = MAX_BITS } = {}) {
+  const { spec, binLow, binHigh, bins, pilotSet, pilotBins, candidates } = bandBins(band);
+
   const dataBins = [];
   const bitsByBin = new Map();
   let bitsPerSymbol = 0;
 
-  for (const k of bins) {
-    if (pilotSet.has(k)) continue;
-    const b = snrByBin ? bitsForSnr(snrByBin.get(k) ?? -Infinity, maxBits) : fallbackBits;
-    if (b <= 0) continue;
+  for (let i = 0; i < candidates.length; i++) {
+    const k = candidates[i];
+    // bitsTable 優先：那是兩端談好的結果，必須逐位元照做。
+    // 用 snrByBin 各自推算是不行的 —— 兩端量到的 SNR 不會一樣。
+    const b = bitsTable ? bitsTable[i]
+      : snrByBin ? bitsForSnr(snrByBin.get(k) ?? -Infinity, maxBits)
+        : fallbackBits;
+    if (!(b > 0)) continue;
     dataBins.push(k);
     bitsByBin.set(k, b);
     bitsPerSymbol += b;
@@ -1172,13 +1189,17 @@ function smoothChannel(hRe, hIm, bins) {
 function demodulate(samples, plan, opts) {
   const { symbols } = opts;
   if (!symbols) throw new Error('需要 opts.symbols');
-  // 短訊框不做時脈追蹤。
+  // 要不要追時脈由呼叫端明講。
   //
-  // ACK 只有 4 個資料符元（96 ms）—— 就算兩端石英差 100 ppm，整段也只漂
-  // 0.46 個 sample，完全不需要補償。但迴路不知道訊框有多短，它照樣從
-  // 雜訊裡估時脈，實測被推到 ±1000 ppm 的上限（真值是個位數），
-  // 星座整個轉掉、CRC 必定不過。訊框短到不值得追蹤時就別追。
-  const trackClock = opts.trackClock ?? symbols >= 16;
+  // 控制訊框（ACK、HELLO、READY）都只有十幾個符元、幾百毫秒 —— 就算兩端
+  // 石英差 100 ppm 也只漂不到一個 sample，完全不需要補償。但迴路不知道
+  // 訊框有多短，它會從雜訊裡硬估出時脈，實測被推到 ±1000 ppm 的上限
+  // （真值是個位數），星座整個轉掉、CRC 必定不過。
+  //
+  // 原本用 symbols >= 16 這個啟發式判斷，結果把 ACK 從 4 個符元加長到 16
+  // （為了重複三份）時，無聲地又把追蹤打開了 —— 症狀是相關峰 4400 卻
+  // 解出一堆亂碼。這種「改別的地方就悄悄改變行為」的耦合不該存在。
+  const trackClock = opts.trackClock ?? true;
 
   const fft = makeFFT();
   const chirp = opts.chirp ?? makeChirp(plan.spec.fLow, plan.spec.fHigh);
@@ -1761,18 +1782,22 @@ function choosePacketLayout(bitsPerSymbol, targetBytes = 96) {
 // 不能假設它收得到第一個封包。重播成本很低（每 16 個封包插一個）。
 //
 //   [ ver:1 | blockSize:2 | segIndex:3 | segCount:3 | segBlocks:3 |
-//     blocksPerSeg:3 | segOffset:6 | fileSize:6 | hash8:8 | nameLen:1 | name:UTF-8 ]
+//     perSeg:6 | segOffset:6 | fileSize:6 | hash8:8 | nameLen:1 | name:UTF-8 ]
 //
-// blocksPerSeg 是「每一段有幾塊」的常數（最後一段可能不足）。續傳時要注入
-// 一個先前收好的段，必須知道它的位移，但 manifest 只帶「目前這一段」的位移。
-// 靠兩端共用同一個預設段長來推是脆弱的 —— 改成直接帶，3 bytes 買到不必約定。
+// perSeg 是「每一段幾個位元組」（最後一段可能不足）。續傳時要注入一個先前
+// 收好的段，必須知道它的位移，而 manifest 只帶「目前這一段」的位移。
+//
+// 這裡原本帶的是 blocksPerSeg，接收端再用 blocksPerSeg × blockSize 反推段長。
+// 那個反推在段長不是 blockSize 整數倍時會偏掉：實測發送端的段長是 4096，
+// 而 42 × 98 = 4116 —— 注入的段會被放到錯的位移，檔案默默壞掉。
+// 直接帶位元組數就沒有這個問題，多花 3 bytes。
 //
 // 長度欄位用 6 bytes（256 TB）而不是 4 bytes：4 bytes 上限只有 4 GB，
 // 而使用者一開口就是 10 GB 的模型檔 —— 就算那個尺寸實際上傳不完，
 // 也不該讓格式本身先爆掉。
 
-const MANIFEST_VERSION = 3;
-const FIXED = 1 + 2 + 3 + 3 + 3 + 3 + 6 + 6 + 8 + 1;
+const MANIFEST_VERSION = 4;
+const FIXED = 1 + 2 + 3 + 3 + 3 + 6 + 6 + 6 + 8 + 1;
 
 const w24 = (o, a, v) => { a[o] = (v >> 16) & 0xff; a[o + 1] = (v >> 8) & 0xff; a[o + 2] = v & 0xff; };
 const r24 = (o, a) => (a[o] << 16) | (a[o + 1] << 8) | a[o + 2];
@@ -1797,12 +1822,12 @@ function encodeManifest(m) {
   w24(3, out, m.segIndex);
   w24(6, out, m.segCount);
   w24(9, out, m.segBlocks);
-  w24(12, out, m.blocksPerSeg);
-  w48(15, out, m.segOffset);
-  w48(21, out, m.fileSize);
-  out.set(m.hash8.subarray(0, 8), 27);
-  out[35] = trimmed.length;
-  out.set(trimmed, 36);
+  w48(12, out, m.perSeg);
+  w48(18, out, m.segOffset);
+  w48(24, out, m.fileSize);
+  out.set(m.hash8.subarray(0, 8), 30);
+  out[38] = trimmed.length;
+  out.set(trimmed, 39);
   return out;
 }
 
@@ -1813,18 +1838,18 @@ function decodeManifest(buf) {
   const segIndex = r24(3, buf);
   const segCount = r24(6, buf);
   const segBlocks = r24(9, buf);
-  const blocksPerSeg = r24(12, buf);
-  const segOffset = r48(15, buf);
-  const fileSize = r48(21, buf);
-  const hash8 = buf.slice(27, 35);
-  const nameLen = buf[35];
-  if (36 + nameLen > buf.length) return null;
-  const name = new TextDecoder().decode(buf.subarray(36, 36 + nameLen));
-  if (blockSize <= 0 || segBlocks <= 0 || fileSize <= 0 || blocksPerSeg <= 0) return null;
-  if (segBlocks > blocksPerSeg) return null;
+  const perSeg = r48(12, buf);
+  const segOffset = r48(18, buf);
+  const fileSize = r48(24, buf);
+  const hash8 = buf.slice(30, 38);
+  const nameLen = buf[38];
+  if (39 + nameLen > buf.length) return null;
+  const name = new TextDecoder().decode(buf.subarray(39, 39 + nameLen));
+  if (blockSize <= 0 || segBlocks <= 0 || fileSize <= 0 || perSeg <= 0) return null;
+  if (segBlocks * blockSize > perSeg + blockSize) return null;
   if (segCount <= 0 || segIndex >= segCount) return null;
   if (segOffset >= fileSize) return null;
-  return { blockSize, segIndex, segCount, segBlocks, blocksPerSeg, segOffset, fileSize, hash8, name };
+  return { blockSize, segIndex, segCount, segBlocks, perSeg, segOffset, fileSize, hash8, name };
 }
 
 function manifestOverhead() { return FIXED; }
@@ -1951,8 +1976,8 @@ function findAck(samples, band, minRatio = 8) {
 
   let r;
   try {
-    r = demodulate(samples.subarray(sync.index, sync.index + need), plan,
-      { symbols: ACK_SYMBOLS, chirp });
+    r = demodulate(samples.subarray(sync.index, Math.min(samples.length, sync.index + need + SYM)), plan,
+      { symbols: ACK_SYMBOLS, chirp, trackClock: false });
   } catch { return null; }
   if (!r.ok) return null;
 
@@ -1983,7 +2008,263 @@ function findAck(samples, band, minRatio = 8) {
   return ack ? { ack, index: sync.index, ratio: sync.ratio, copy: -1 } : null;
 }
 
+// ═══ ../src/transfer/handshake.js ══════════════════════════════
+// 傳送前的交握。
+//
+// 原本是「發送端自己選調變、直接開始送」，接收端再從兩種候選裡猜。這有三個
+// 代價：猜錯就整場報廢；每個副載波被迫用同一種調變，而實測逐 bin 的 SNR
+// 差到 13 dB；接收端手上已經有的段，發送端要等好幾個訊框後的 ACK 才知道。
+//
+// 交握把這三件事一次談完：
+//
+//   發送端 ──HELLO──▶  檔案雜湊、大小、分段幾何
+//   接收端 ──READY──▶  我已經有哪幾段、各副載波你該用幾個 bit
+//   發送端            照著談好的配置開始送
+//
+// HELLO 走正向 chirp、READY 走反向 chirp，跟資料訊框與 ACK 共用同一套實體層。
+// 兩者都用 BPSK 打滿整個頻段 —— 交握本身不能依賴還沒談成的參數。
+//
+// 談不成也要能跑：發送端試幾次收不到 READY 就退回原本的固定調變，
+// 接收端則永遠把「談好的配置」和原本的 qpsk/bpsk 一起當候選，
+// 用 CRC 通過數決定採用哪一個。任何一邊的交握失敗都只是回到舊行為。
+const HELLO_MAGIC = 0x5748;      // "WH"
+const READY_MAGIC = 0x5752;      // "WR"
+
+// 符元數要讓「三份都塞得下」。HELLO 酬載 27 bytes，三份 81 bytes，
+// BPSK 打滿 stealth 是 59 bits/符元 → 至少 11 個，取 12 留餘裕。
+// 塞不下三份就沒有多數決可做，只能逐份試 CRC —— 實測 10 dB 時
+// 成功率從 8/8 掉到 7/8，而交握失敗的代價是整場退回舊行為。
+const HELLO_SYMBOLS = 12;
+const READY_SYMBOLS = 14;
+
+// 配置表以「連續 4 個候選 bin」為一組。逐 bin 要 59×3=177 bits，
+// 而實測的通道曲線在相鄰 bin 之間差不到 1 dB —— 分組幾乎不損失什麼，
+// 表卻從 23 bytes 縮到 6 bytes，重複三份也塞得下一個短訊框。
+const BIT_GROUP = 4;
+// 3 bits 一組，索引這五個階數（0 代表這組 bin 不用）
+const LADDER5 = [0, 1, 2, 4, 6];
+
+const HELLO_BYTES = 2 + 8 + 6 + 3 + 6 + 2;        // magic hash8 fileSize segCount perSeg crc
+const READY_FIXED = 2 + 8 + 1 + 3 + 4 + 1;        // magic hash8 flags haveFirst haveBitmap groups
+const HAVE_SEGMENTS = 32;                          // haveBitmap 涵蓋的段數
+const READY_COPIES = 3;
+
+const helloPlan = (band) => makePlan({ band, fallbackBits: 1 });
+const helloChirp = (plan) => makeChirp(plan.spec.fLow, plan.spec.fHigh);
+const readyChirp = (plan) => makeChirp(plan.spec.fHigh, plan.spec.fLow);
+
+const helloFrameSamples = () => PREAMBLE_LEN + (PROBE_SYMS + HELLO_SYMBOLS) * SYM;
+const readyFrameSamples = () => PREAMBLE_LEN + (PROBE_SYMS + READY_SYMBOLS) * SYM;
+
+function groupCount(band) {
+  return Math.ceil(bandBins(band).candidates.length / BIT_GROUP);
+}
+const tableBytes = (band) => Math.ceil((groupCount(band) * 3) / 8);
+const readyPayloadBytes = (band) => READY_FIXED + tableBytes(band) + 2;
+
+// 這幾個位元組小工具跟 manifest.js 的同名函式參數順序不同（那邊是 (offset, array, value)），
+// 刻意不共用也刻意不同名 —— 打包是攤平到同一個作用域，同名會直接 SyntaxError
+const put24 = (a, o, v) => { a[o] = (v >> 16) & 0xff; a[o + 1] = (v >> 8) & 0xff; a[o + 2] = v & 0xff; };
+const get24 = (a, o) => (a[o] << 16) | (a[o + 1] << 8) | a[o + 2];
+const put48 = (a, o, v) => {
+  const hi = Math.floor(v / 0x100000000);
+  a[o] = (hi >> 8) & 0xff; a[o + 1] = hi & 0xff;
+  const lo = v >>> 0;
+  a[o + 2] = (lo >>> 24) & 0xff; a[o + 3] = (lo >>> 16) & 0xff;
+  a[o + 4] = (lo >>> 8) & 0xff; a[o + 5] = lo & 0xff;
+};
+const get48 = (a, o) => ((a[o] << 8) | a[o + 1]) * 0x100000000 +
+  (((a[o + 2] << 24) >>> 0) + (a[o + 3] << 16) + (a[o + 4] << 8) + a[o + 5]);
+
+const seal = (a) => { const c = crc16(a, 0, a.length - 2); a[a.length - 2] = (c >> 8) & 0xff; a[a.length - 1] = c & 0xff; return a; };
+const checked = (a, magic) => {
+  if (a.length < 4 || ((a[0] << 8) | a[1]) !== magic) return false;
+  return crc16(a, 0, a.length - 2) === ((a[a.length - 2] << 8) | a[a.length - 1]);
+};
+
+// ---------------------------------------------------------------- HELLO
+
+function encodeHello({ hash8, fileSize, segCount, perSeg }) {
+  const a = new Uint8Array(HELLO_BYTES);
+  a[0] = HELLO_MAGIC >> 8; a[1] = HELLO_MAGIC & 0xff;
+  a.set(hash8.subarray(0, 8), 2);
+  put48(a, 10, fileSize);
+  put24(a, 16, segCount);
+  put48(a, 19, perSeg);
+  return seal(a);
+}
+
+function decodeHello(a) {
+  if (!checked(a.subarray(0, HELLO_BYTES), HELLO_MAGIC)) return null;
+  const fileSize = get48(a, 10), segCount = get24(a, 16), perSeg = get48(a, 19);
+  if (fileSize <= 0 || segCount <= 0 || perSeg <= 0) return null;
+  return { hash8: a.slice(2, 10), fileSize, segCount, perSeg };
+}
+
+// ---------------------------------------------------------------- 配置表
+
+/** 依實測 SNR 決定每一組要用幾個 bit（margin 是額外保留的裕度） */
+function packBitsTable(band, snrByBin, marginDb = 3, maxBits = MAX_BITS) {
+  const { candidates } = bandBins(band);
+  const n = groupCount(band);
+  const out = new Uint8Array(tableBytes(band));
+  for (let g = 0; g < n; g++) {
+    // 一組裡取最差的那個 bin —— 同一組共用階數，遷就最弱的才不會整組錯
+    let worst = Infinity;
+    for (let i = g * BIT_GROUP; i < Math.min(candidates.length, (g + 1) * BIT_GROUP); i++) {
+      const v = snrByBin?.get(candidates[i]);
+      worst = Math.min(worst, Number.isFinite(v) ? v : -Infinity);
+    }
+    const bits = bitsForSnr(worst - marginDb, maxBits);
+    const code = Math.max(0, LADDER5.indexOf(bits));
+    const bit = g * 3;
+    // 3 bits 可能跨位元組
+    out[bit >> 3] |= (code << 5) >> (bit & 7);
+    if ((bit & 7) > 5) out[(bit >> 3) + 1] |= (code << (13 - (bit & 7))) & 0xff;
+  }
+  return out;
+}
+
+/** 攤平成 makePlan 要的「每個候選 bin 幾個 bit」陣列 */
+function unpackBitsTable(band, packed) {
+  const { candidates } = bandBins(band);
+  const n = groupCount(band);
+  const out = new Uint8Array(candidates.length);
+  for (let g = 0; g < n; g++) {
+    const bit = g * 3;
+    let code = (packed[bit >> 3] << (bit & 7)) & 0xff;
+    if ((bit & 7) > 5) code |= packed[(bit >> 3) + 1] >> (8 - (bit & 7));
+    code >>= 5;
+    const bits = LADDER5[code] ?? 0;
+    for (let i = g * BIT_GROUP; i < Math.min(candidates.length, (g + 1) * BIT_GROUP); i++) out[i] = bits;
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------- READY
+
+function encodeReady({ band, hash8, have = [], table, refuse = false }) {
+  const a = new Uint8Array(readyPayloadBytes(band));
+  a[0] = READY_MAGIC >> 8; a[1] = READY_MAGIC & 0xff;
+  a.set(hash8.subarray(0, 8), 2);
+  a[10] = refuse ? 1 : 0;
+  const first = have.length ? Math.min(...have) : 0;
+  put24(a, 11, first);
+  for (const s of have) {
+    const rel = s - first;
+    if (rel >= 0 && rel < HAVE_SEGMENTS) a[14 + (rel >> 3)] |= 1 << (rel & 7);
+  }
+  a[18] = groupCount(band);
+  a.set(table.subarray(0, tableBytes(band)), 19);
+  return seal(a);
+}
+
+function decodeReady(band, a) {
+  const need = readyPayloadBytes(band);
+  if (a.length < need || !checked(a.subarray(0, need), READY_MAGIC)) return null;
+  if (a[18] !== groupCount(band)) return null;      // 兩端的頻段設定不一致
+  const first = get24(a, 11);
+  const have = [];
+  for (let i = 0; i < HAVE_SEGMENTS; i++) if (a[14 + (i >> 3)] & (1 << (i & 7))) have.push(first + i);
+  return { hash8: a.slice(2, 10), refuse: a[10] === 1, have, table: a.slice(19, 19 + tableBytes(band)) };
+}
+
+// ---------------------------------------------------------------- 實體層
+
+function modulateMsg(plan, chirp, symbols, payload, copies) {
+  const bytesPerFrame = Math.floor((symbols * plan.bitsPerSymbol) / 8);
+  const buf = new Uint8Array(bytesPerFrame);
+  for (let c = 0; c < copies; c++) {
+    const off = c * payload.length;
+    if (off + payload.length > bytesPerFrame) break;
+    buf.set(payload, off);
+  }
+  return modulate(buf, plan, { chirp }).samples;
+}
+
+/**
+ * 從訊框裡取出訊息：先逐份試 CRC，都不過就對位元做多數決。
+ * 跟 ACK 用同一招 —— 實機上這種短訊框的解調 SNR 只有 5 dB 左右。
+ */
+function extract(bytes, size, copies, decode) {
+  const views = [];
+  for (let c = 0; c < copies; c++) {
+    const off = c * size;
+    if (off + size > bytes.length) break;
+    const v = bytes.subarray(off, off + size);
+    const got = decode(v);
+    if (got) return got;
+    views.push(v);
+  }
+  if (views.length < 3) return null;
+  const merged = new Uint8Array(size);
+  for (let i = 0; i < size; i++) {
+    let v = 0;
+    for (let b = 0; b < 8; b++) {
+      let ones = 0;
+      for (const c of views) ones += (c[i] >> b) & 1;
+      if (ones * 2 > views.length) v |= 1 << b;
+    }
+    merged[i] = v;
+  }
+  return decode(merged);
+}
+
+function modulateHello(band, payload) {
+  const plan = helloPlan(band);
+  return modulateMsg(plan, helloChirp(plan), HELLO_SYMBOLS, payload, READY_COPIES);
+}
+
+function modulateReady(band, payload) {
+  const plan = helloPlan(band);
+  return modulateMsg(plan, readyChirp(plan), READY_SYMBOLS, payload, READY_COPIES);
+}
+
+function findMsg(samples, band, chirpOf, symbols, need, minRatio, size, decode) {
+  const plan = helloPlan(band);
+  const chirp = chirpOf(plan);
+  // 緩衝是滾動的，最新的那個交握訊框往往才錄到一半 —— 它的相關峰卻是最強的，
+  // 挑到它就等於挑到一個註定解不開的位置，而且會蓋掉前一個完整的訊框。
+  // 實測相關峰 3945（門檻 8）卻一次都解不出來。
+  //
+  // 不能用 findPreamble 的 searchLen 去夾 —— 那限制的是「參與相關的訊號範圍」
+  // 而不是「可接受的峰值位置」，會把 chirp 本身切斷。改成找到之後檢查尾巴，
+  // 不夠就在它前面重找一次。
+  let sync = findPreamble(samples, chirp);
+  if (sync.index >= 0 && samples.length - sync.index < need) {
+    if (sync.index <= chirp.length) return null;
+    sync = findPreamble(samples.subarray(0, sync.index), chirp);
+  }
+  if (sync.index < 0 || sync.ratio < minRatio) return null;
+  if (samples.length - sync.index < need) return null;
+  // 多切一個符元的餘裕。
+  //
+  // 切剛好等於訊框長度時，離線沒事（訊框位置是精確的），實機必定失敗：
+  // 相關峰的定時解析度只有幾個 sample，切點會落在訊框開始前一點點，
+  // demodulate 內部重新同步之後就少了那幾個 sample，直接回 ok=false。
+  // 症狀是「相關峰 4638、卻一次都解不開」。
+  const end = Math.min(samples.length, sync.index + need + SYM);
+  let r;
+  try { r = demodulate(samples.subarray(sync.index, end), plan, { symbols, chirp, trackClock: false }); } catch { return null; }
+  if (!r.ok) return null;
+  const got = extract(r.bytes, size, READY_COPIES, decode);
+  // snrByBin 一併帶出去：HELLO 的 probe 符元就是通道量測本身，
+  // 接收端要靠它決定回報的位元配置，沒必要再解一次
+  return got ? { msg: got, index: sync.index, ratio: sync.ratio, snrByBin: r.snrByBin } : null;
+}
+
+function findHello(samples, band, minRatio = 8) {
+  return findMsg(samples, band, helloChirp, HELLO_SYMBOLS, helloFrameSamples(),
+    minRatio, HELLO_BYTES, decodeHello);
+}
+
+function findReady(samples, band, minRatio = 8) {
+  return findMsg(samples, band, readyChirp, READY_SYMBOLS, readyFrameSamples(),
+    minRatio, readyPayloadBytes(band), (a) => decodeReady(band, a));
+}
+
 // ═══ ../src/transfer/crypto.js ═════════════════════════════════
+
 // 以密碼加密傳輸內容。
 //
 // 為什麼不是「輸入密碼才顯示介面」那種閘門：這是純前端的靜態網頁，
@@ -2002,6 +2283,13 @@ function findAck(samples, band, minRatio = 8) {
 // 檔名放在密文裡面，不放 manifest —— 否則檔名會外洩。
 
 const MAGIC = new Uint8Array([0x57, 0x53, 0x45, 0x31]); // "WSE1"
+
+const concat = (...parts) => {
+  const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+  let o = 0;
+  for (const p of parts) { out.set(p, o); o += p.length; }
+  return out;
+};
 const SALT_BYTES = 16;
 const IV_BYTES = 12;
 const HEADER = MAGIC.length + SALT_BYTES + IV_BYTES;
@@ -2039,8 +2327,20 @@ async function encryptFile(password, name, bytes) {
   plain.set(nameBytes, 1);
   plain.set(bytes, 1 + nameBytes.length);
 
-  const salt = crypto.getRandomValues(new Uint8Array(SALT_BYTES));
-  const iv = crypto.getRandomValues(new Uint8Array(IV_BYTES));
+  // salt 與 iv 由明文推導，不是亂數。
+  //
+  // 用亂數的話，同一個檔案每次加密都得到完全不同的密文 —— 而傳的是密文，
+  // 於是接收端上一次存下來的段永遠對不上這一次的位元組流，跨工作階段的
+  // 續傳在本質上就不可能。實測「傳一半停掉、重傳」完全沒有加速。
+  //
+  // 代價：同樣的檔案配同樣的密碼，每次都產生一模一樣的密文，等於洩漏
+  // 「這是同一個檔案」。這件事本來就藏不住（續傳的前提就是認得出同一個檔案）。
+  // 真正危險的是「同一組 key+iv 拿去加密不同明文」—— 這裡 iv 由明文雜湊
+  // 推導，明文不同 iv 必然不同，那個陷阱不會踩到。
+  // salt 綁在明文上而不是固定值，所以不同檔案仍有不同的 key。
+  const seed = sha256(plain);
+  const salt = sha256(concat(new TextEncoder().encode('wavesync/salt/v1'), seed)).subarray(0, SALT_BYTES);
+  const iv = sha256(concat(new TextEncoder().encode('wavesync/iv/v1'), seed, salt)).subarray(0, IV_BYTES);
   const key = await deriveKey(password, salt);
   const ct = new Uint8Array(await subtle().encrypt({ name: 'AES-GCM', iv }, key, plain));
 
@@ -2144,8 +2444,20 @@ const DEFAULT_SEGMENT_BYTES = 1024 * 1024;
 // 使用者忘了按停止就會有一個看不見的分頁在背景一直發聲（實際發生過）。
 const SEGMENT_BUDGET = 1.8;
 
+/**
+ * @param {string} band
+ * @param {string|Uint8Array} mod  'qpsk'/'bpsk'，或交握談好的逐 bin 配置表
+ *        （已解包成「每個候選 bin 幾個 bit」的陣列）
+ */
 function sessionLayout(band, mod = 'qpsk') {
-  const plan = makePlan({ band, fallbackBits: MODULATION[mod] ?? 2 });
+  const plan = mod instanceof Uint8Array
+    ? makePlan({ band, bitsTable: mod })
+    : makePlan({ band, fallbackBits: MODULATION[mod] ?? 2 });
+  // 沒有任何可用副載波的 plan 會一路產生 NaN（封包大小 0、K 變 NaN），
+  // 而且到很後面才看得出來。寧可在這裡就停。
+  if (!(plan.bitsPerSymbol > 0)) {
+    throw new Error(`這個配置沒有任何可用的副載波（${band}）`);
+  }
   const layout = choosePacketLayout(plan.bitsPerSymbol);
   const packetsPerFrame = Math.max(1, Math.floor(FRAME_DATA_SYMBOLS / layout.symbols));
   const dataSymbols = FRAME_DATA_SYMBOLS;
@@ -2158,8 +2470,12 @@ function sessionLayout(band, mod = 'qpsk') {
 }
 
 function planSegments(fileSize, payloadSize, segmentBytes = DEFAULT_SEGMENT_BYTES) {
-  // 段長取 payloadSize 的整數倍，讓每段的塊數乾淨、最後一塊不用跨段補零
-  const perSeg = Math.max(payloadSize, Math.floor(segmentBytes / payloadSize) * payloadSize);
+  // 段的邊界只由 segmentBytes 決定，不跟著 payloadSize 走。
+  //
+  // 原本取 payloadSize 的整數倍（讓最後一塊不用補零），但那讓「第幾段」的
+  // 意義隨調變而變 —— 交握會依當下的通道談出不同的配置，續傳時上一次存下來
+  // 的段就對不上位移了。乾淨的塊邊界只是省一點點補零，段的身分穩定重要得多。
+  const perSeg = Math.max(payloadSize, segmentBytes);
   const segCount = Math.max(1, Math.ceil(fileSize / perSeg));
   return { perSeg, segCount, blocksPerSeg: Math.ceil(perSeg / payloadSize) };
 }
@@ -2170,7 +2486,8 @@ class SendSession {
   /**
    * @param {{band:string, name:string, bytes:Uint8Array, segmentBytes?:number}} opts
    */
-  constructor({ band, mod = 'qpsk', name, bytes, segmentBytes = DEFAULT_SEGMENT_BYTES }) {
+  constructor({ band, mod = 'qpsk', name, bytes, segmentBytes = DEFAULT_SEGMENT_BYTES,
+    preAcked = [] }) {
     Object.assign(this, sessionLayout(band, mod));
     this.band = band;
     this.mod = mod;
@@ -2183,7 +2500,9 @@ class SendSession {
     this.segCount = seg.segCount;
 
     this.segIndex = 0;
-    this.acked = new Set();          // 由 ACK 標記已完成的段（目前尚無 ACK 通道）
+    // 交握時對方已經回報「我有這幾段」的，一開始就跳過 —— 這正是續傳的意義，
+    // 不必等到跑完好幾個訊框、收到第一個 ACK 才知道
+    this.acked = new Set(preAcked.filter((i) => i >= 0 && i < this.segCount));
     this.segCounters = new Map();    // 每段的 seed 進度，換段回來要接續
     this.covered = new Set();        // 這一輪已經送過的段
     this.roundComplete = false;
@@ -2207,7 +2526,11 @@ class SendSession {
     this.frameBytes = new Uint8Array(
       Math.floor((this.dataSymbols * this.plan.bitsPerSymbol) / 8));
     this.scratch = new Uint8Array(this.layout.payloadSize);
-    this._openSegment(0);
+    // 第 0 段可能已經在對方手上了
+    let start = 0;
+    while (start < this.segCount && this.acked.has(start)) start++;
+    if (start >= this.segCount) { this.remoteDone = true; start = 0; }
+    this._openSegment(start);
   }
 
   _openSegment(i) {
@@ -2228,7 +2551,7 @@ class SendSession {
       segIndex: i,
       segCount: this.segCount,
       segBlocks: this.encoder.k,
-      blocksPerSeg: Math.ceil(this.perSeg / this.layout.payloadSize),
+      perSeg: this.perSeg,
       segOffset: this.segOffset,
       fileSize: this.bytes.length,
       hash8: this.hash,
@@ -2595,9 +2918,14 @@ class ReceiveSession {
       this.file = {
         name: m.name, fileSize: m.fileSize, segCount: m.segCount,
         hash8: m.hash8, blockSize: m.blockSize,
-        perSeg: m.blocksPerSeg * m.blockSize,
+        perSeg: m.perSeg,
       };
       this.onFileKnown?.(this.file);
+    } else if (this.file.blockSize === 0) {
+      // 交握先建立的骨架，manifest 到了才補上塊大小與檔名
+      if (this.file.fileSize !== m.fileSize) return null;
+      this.file.blockSize = m.blockSize;
+      this.file.name = m.name;
     } else if (this.file.fileSize !== m.fileSize || !this.file.hash8.every((v, i) => v === m.hash8[i])) {
       return null;              // 換了別的檔案，忽略
     }
@@ -2642,6 +2970,36 @@ class ReceiveSession {
     return [...this.binSnrSum.entries()]
       .map(([k, [sum, n]]) => [k, sum / n])
       .sort((a, b) => a[0] - b[0]);
+  }
+
+  /**
+   * 加入交握談好的配置當候選，並排到最前面。
+   *
+   * 不是「換成它」而是「多一個候選」：READY 有可能在半路掉了，那時發送端
+   * 會退回固定調變，而接收端這邊並不知道。把兩種都留著、用 CRC 通過數決定
+   * 採用哪一個，任何一邊的交握失敗都只是回到舊行為，不會整場報廢。
+   */
+  /**
+   * 交握就先建立檔案資訊，不必等 manifest。
+   *
+   * 續傳要在交握時就把手上的段注入進來（才能回報「這幾段你可以跳過」），
+   * 但 injectSegment 需要 file 才知道段的位移 —— 而 file 原本只有收到
+   * manifest 才會建立。HELLO 帶的資訊剛好夠：雜湊、長度、段數、段長。
+   * blockSize 留給 manifest 補，注入的段用不到它。
+   */
+  adoptFileInfo({ hash8, fileSize, segCount, perSeg }) {
+    if (this.file) return this.file;
+    this.file = { name: null, fileSize, segCount, hash8, blockSize: 0, perSeg };
+    this.onFileKnown?.(this.file);
+    return this.file;
+  }
+
+  addNegotiated(bitsTable) {
+    const key = 'nego';
+    this.layouts.set(key, sessionLayout(this.band, bitsTable));
+    this.candidates = [key, ...this.candidates.filter((c) => c !== key)];
+    if (this.detectedMod === null && this.candidates.length === 1) this.detectedMod = key;
+    return this.layouts.get(key);
   }
 
   stats() {
@@ -2972,6 +3330,26 @@ class SegmentStore {
 // 實機量到解調有 12× 即時餘裕，不需要 Worker 也追得上。
 const LOOKAHEAD_SEC = 6;        // 音訊排程的前置量
 const ACK_EVERY = 3;            // 每這麼多個聽窗回報一次（見 sendAckIfDue）
+// 交握等這麼久還沒回應就放棄，退回固定調變。
+//
+// 以「時間」而不是「送了幾次」為準：排程前置量有 6 秒，而交握訊框的週期
+// 只有 1.7 秒 —— 用次數算的話，第一次 pump 就把配額全部排掉了，
+// 接收端連解第一個 HELLO 都還沒解完（實測 5 次在 6 秒內用光）。
+//
+// 7 秒 ≈ 4 個交握週期。反向鏈路正常時第一、二次就會回；不正常時這 7 秒
+// 是純粹的損失，所以不能設太長（原本 14 秒等於整場多花 28%）。
+const HELLO_WAIT_SEC = 7;
+// 交握期間把排程前置量壓短，否則決定改用資料訊框時，
+// 已經排進去的 HELLO 還要播好幾秒
+const LOOKAHEAD_PROBE_SEC = 2.2;
+// 位元配置在實測 SNR 之外再留的裕度。
+//
+// probe 量到的 SNR 嚴重樂觀：它是 5 個 probe 符元平均後的結果，雜訊被平均掉
+// 一大截，而且 probe 是已知序列、不受星座判決誤差影響。實機量到中位 38 dB，
+// 但資料符元的實際可用 SNR 只有 10 dB 出頭。這個差距沒有理論值可推，
+// 只能實測校準 —— 所以留成可調，並由對測腳本掃出最佳值。
+const DEFAULT_BIT_MARGIN_DB = 20;
+const bitMargin = () => Number(globalThis.__wsMargin ?? DEFAULT_BIT_MARGIN_DB);
 
 const $ = (id) => document.getElementById(id);
 const log = (m) => { const e = $('log'); e.textContent += m + '\n'; e.scrollTop = e.scrollHeight; };
@@ -3036,14 +3414,23 @@ async function startSend() {
   }
   state.ctx = ctx;
 
-  // 檔名放在密文裡，manifest 只帶一個固定名稱 —— 否則檔名會外洩
-  const tx = new SendSession({ band: currentBand(), mod: currentMod(), name: ENCRYPTED_NAME, bytes: payload });
-  state.tx = tx;
-  log(`開始傳送（原始檔名已加密，不會出現在音訊裡）`);
-  log(`分成 ${tx.segCount} 段，每段 ${fmtBytes(tx.perSeg)}（K=${tx.encoder.k}）`);
-  log(`每訊框 ${tx.packetsPerFrame} 封包 / ${tx.frameSec.toFixed(2)} s`);
-  log(`SHA-256 ${hex(tx.hash).slice(0, 16)}…`);
-  log('音量開到最大，手機貼在喇叭上 2–3 cm。噴泉碼會一直送到你按停止為止。');
+  // 交握先行：SendSession 要等談完才建，因為調變與「哪幾段可以跳過」
+  // 都是談出來的，而那兩件事會決定封包大小與分段進度
+  state.payload = payload;
+  state.hash = sha256(payload);
+  state.hsPhase = 'probing';
+  state.helloTries = 0;
+  state.tx = null;
+  // 段長可從外部覆寫：預設 1 MB 的話，要測「跳過已收段」得傳好幾 MB、
+  // 在聲學速率下要好幾小時。對測腳本會把它調小。
+  const perSeg = Number(globalThis.__wsSegBytes ?? DEFAULT_SEGMENT_BYTES);
+  state.hello = encodeHello({
+    hash8: state.hash, fileSize: payload.length,
+    segCount: Math.max(1, Math.ceil(payload.length / perSeg)), perSeg,
+  });
+  log(`開始交握（原始檔名已加密，不會出現在音訊裡）`);
+  log(`SHA-256 ${hex(state.hash).slice(0, 16)}…`);
+  log('音量開到最大，手機貼在喇叭上 2–3 cm。');
 
   const gainDb = Number(document.querySelector('input[name=txgain]:checked').value);
   state.txGain = Math.pow(10, gainDb / 20);
@@ -3096,6 +3483,8 @@ async function startSend() {
       state.ackReplies = (state.ackReplies ?? 0) + 1;
       state.lastAckRatio = ev.data.ratio ?? 0;
       state.bestAckRatio = Math.max(state.bestAckRatio ?? 0, ev.data.ratio ?? 0);
+      if (ev.data.why) state.ackWhy = ev.data.why;
+      if (ev.data.mode === 'ready') { if (ev.data.found) applyReady(ev.data.found.ready); return; }
       // 相關峰明顯高於底噪就表示信標真的在，這時記下它離預期聽窗有多遠。
       // 解不開但找得到，最可能就是它落到發送端自己的訊框上了。
       if ((ev.data.ratio ?? 0) > 40 && state.ackExpect) {
@@ -3123,18 +3512,31 @@ async function startSend() {
   state.txSpec.attach(ctx, gain);
 
   let nextTime = ctx.currentTime + 0.15;
+  state.hsStart = ctx.currentTime;
   const pump = () => {
-    if (!state.tx) return;
+    if (state.hsPhase === 'off') return;
     // 排程到 currentTime + LOOKAHEAD 為止。噴泉碼是無限串流，
     // 只能邊播邊產生，不能先做一大塊。
-    if (tx.finished) {
-      log(`✓ 接收端回報已收齊（共 ${tx.stats().ackCount} 次回報），自動停止。`);
+    if (state.tx?.finished) {
+      log(`✓ 接收端回報已收齊（共 ${state.tx.stats().ackCount} 次回報），自動停止。`);
       stopSend();
       return;
     }
-    checkForAck(tx);
-    while (nextTime < ctx.currentTime + LOOKAHEAD_SEC) {
-      const samples = tx.nextFrame();
+    checkForAck(state.tx);
+    // 交握試夠次數還是沒回應就自己開始 —— 對方可能根本沒開麥克風，
+    // 或反向鏈路不通。那不該讓傳送完全動不了。
+    if (state.hsPhase === 'probing' && ctx.currentTime - state.hsStart > HELLO_WAIT_SEC) {
+      log(`⚠ 交握 ${HELLO_WAIT_SEC} 秒沒有回應（送了 ${state.helloTries} 次），` +
+        `改用手動選的 ${currentMod()}，速率會保守很多。`);
+      log('  回報走的是「手機喇叭 → 電腦麥克風」這個反方向。收不到通常是：' +
+        '手機沒開始接收、手機媒體音量太小、或手機的喇叭那一端被壓住／朝向桌面。');
+      beginSending(currentMod(), []);
+    }
+    const ahead = state.hsPhase === 'probing' ? LOOKAHEAD_PROBE_SEC : LOOKAHEAD_SEC;
+    while (nextTime < ctx.currentTime + ahead) {
+      const samples = state.hsPhase === 'probing'
+        ? (state.helloTries++, modulateHello(currentBand(), state.hello))
+        : state.tx.nextFrame();
       if (state.txGain !== 1) for (let i = 0; i < samples.length; i++) samples[i] *= state.txGain;
       const buf = ctx.createBuffer(1, samples.length, SR);
       buf.copyToChannel(samples, 0);
@@ -3148,7 +3550,8 @@ async function startSend() {
       state.ackWindows.push({ start: winStart, end: nextTime });
       if (state.ackWindows.length > 8) state.ackWindows.shift();
     }
-    renderTx(tx);
+    if (state.tx) renderTx(state.tx);
+    else renderHandshake(ctx);
   };
   state.t0 = performance.now();
   pump();
@@ -3167,6 +3570,7 @@ async function startSend() {
 // 搜尋區間和 3.9 s 的訊框週期對不上，312 ms 的回報常常剛好落在裁掉的部分。
 function checkForAck(tx) {
   if (!state.txRec || !state.ackBuf.length || !state.ackWindows.length) return;
+  if (state.hsPhase !== 'probing' && !tx) return;
 
   // ctx 時間 → 錄音緩衝索引。錄到最後一塊的時刻是 ackAt，對應 ackTotal；
   // 麥克風本身有輸入延遲，聽窗在錄音裡會晚 inLatency 出現。
@@ -3193,7 +3597,56 @@ function checkForAck(tx) {
   // 記下這次搜的緩衝裡，預期的聽窗落在哪 —— 回來時就能量出信標的實際偏差
   state.ackExpect = { lo: toIndex(win.start) - state.ackBase, hi: toIndex(win.end) - state.ackBase };
   // buffer 交出所有權，避免每 4 秒複製 768 KB
-  state.ackWorker.postMessage({ buf: buf.buffer, band: currentBand(), id: state.ackScans }, [buf.buffer]);
+  state.ackWorker.postMessage({ buf: buf.buffer, band: currentBand(), id: state.ackScans,
+    mode: state.hsPhase === 'probing' ? 'ready' : 'ack' }, [buf.buffer]);
+}
+
+/** 收到 READY：照對方談好的配置開始送，並跳過它已經有的段 */
+function applyReady(ready) {
+  if (state.hsPhase !== 'probing') return;
+  if (!state.hash.subarray(0, 8).every((v, i) => v === ready.hash8[i])) return;   // 不是這個檔
+  const table = unpackBitsTable(currentBand(), ready.table);
+  const used = table.filter((b) => b > 0).length;
+  const bits = table.reduce((a, b) => a + b, 0);
+  // 配置表要能撐起一個像樣的鏈路才採用。
+  //
+  // 全零的表會建出一個沒有任何副載波的 plan —— 封包大小變成 0、K 變成 NaN，
+  // 整場傳輸靜默壞掉（實測畫面顯示「分成 NaN 段」）。CRC 擋得住位元錯誤，
+  // 擋不住「內容合法但不合理」，所以這一關要自己把。
+  const MIN_BITS = 32;
+  if (bits < MIN_BITS || used < table.length / 4) {
+    log(`⚠ 對方回報的通道配置太差（${bits} bits/符元、${used}/${table.length} 個副載波），` +
+      `不採用，改用手動選的 ${currentMod()}。`);
+    beginSending(currentMod(), ready.have);
+    return;
+  }
+  log(`↩ 交握成功：對方量到的通道可載 ${bits} bits/符元` +
+    `（${used}/${table.length} 個副載波可用）` +
+    `${ready.have.length ? `，已有 ${ready.have.length} 段可跳過` : ''}`);
+  beginSending(table, ready.have);
+}
+
+function beginSending(modOrTable, preAcked) {
+  const tx = new SendSession({
+    band: currentBand(), mod: modOrTable, name: ENCRYPTED_NAME,
+    bytes: state.payload, preAcked,
+    segmentBytes: Number(globalThis.__wsSegBytes ?? DEFAULT_SEGMENT_BYTES),
+  });
+  state.tx = tx;
+  state.hsPhase = 'running';
+  log(`分成 ${tx.segCount} 段，每段 ${fmtBytes(tx.perSeg)}（K=${tx.encoder.k}）` +
+    `${preAcked.length ? `，跳過 ${preAcked.length} 段` : ''}`);
+  log(`每訊框 ${tx.packetsPerFrame} 封包 × ${tx.layout.payloadSize} B / ${tx.frameSec.toFixed(2)} s` +
+    ` → 理論 ${tx.payloadBps.toFixed(0)} B/s`);
+}
+
+function renderHandshake(ctx) {
+  const left = Math.max(0, HELLO_WAIT_SEC - (ctx.currentTime - state.hsStart));
+  $('txProgress').innerHTML =
+    `<div class="drow info"><span>交握中</span><b>已送 ${state.helloTries} 次 HELLO，` +
+    `等待接收端回報通道狀況（還有 ${left.toFixed(0)} 秒）</b></div>` +
+    `<div class="drow info"><span>用意</span><b>讓接收端量測每個副載波能承載幾個 bit，` +
+    `並告知它已經收好哪幾段</b></div>`;
 }
 
 function applyFoundAck(tx, got) {
@@ -3234,6 +3687,7 @@ function renderTx(tx) {
 }
 
 async function stopSend() {
+  state.hsPhase = 'off';
   state.ackWorker?.terminate();
   state.ackWorker = null;
   state.ackBusy = false;
@@ -3367,10 +3821,21 @@ async function startReceive() {
   // 這兩個數字是把訊框位置換算成輸出排程時間的唯一依據。
   state.recorded = 0;
   state.recordedAt = 0;
+  // 交握期間另外留一份原始音訊：HELLO 訊框只有 0.5 s，比資料訊框短得多，
+  // ReceiveSession 的緩衝要等整個資料訊框長度到齊才動，等不及。
+  // 鎖定調變之後就不再累積。
+  state.hsBuf = [];
+  state.hsTotal = 0;
+  state.hsSeen = false;
   const rec = await makeRecorder(ctx, (chunk) => {
     queue.push(chunk);
     state.recorded += chunk.length;
     state.recordedAt = ctx.currentTime;
+    if (!state.hsSeen) {
+      state.hsBuf.push(chunk);
+      state.hsTotal += chunk.length;
+      while (state.hsTotal > SR * 3 && state.hsBuf.length > 1) state.hsTotal -= state.hsBuf.shift().length;
+    }
   });
   const mute = ctx.createGain();
   mute.gain.value = 0;
@@ -3407,7 +3872,22 @@ async function startReceive() {
   state.acksSent = 0;
   state.lastAckLead = null;
   state.ackedFrameEnd = -1;
-  log(`開始接收（${currentBand()}，調變自動偵測）。解調排在主執行緒分次做 —— 實機有 12× 即時餘裕。`);
+
+  // 找 HELLO 跟找 ACK 一樣是大型 FFT，同樣不能佔住主執行緒 ——
+  // 接收端的主執行緒要跑解調，被卡住就會漏訊框
+  state.hsWorker = new Worker(URL.createObjectURL(
+    new Blob([WORKER_SRC], { type: 'text/javascript' })));
+  state.hsWorker.onmessage = (ev) => {
+    state.hsBusy = false;
+    state.hsRatio = ev.data.ratio ?? 0;
+    state.hsBestRatio = Math.max(state.hsBestRatio ?? 0, ev.data.ratio ?? 0);
+    if (ev.data.why) state.hsWhy = ev.data.why;
+    if (ev.data.found) onHello(ev.data.found, store, ev.data.index);
+  };
+  state.hsWorker.onerror = () => { state.hsBusy = false; };
+  state.hsScans = 0;
+
+  log(`開始接收（${currentBand()}）。先等發送端的交握訊框，談不成則自動偵測調變。`);
   log(`回報時序：輸入延遲 ${(state.inLatency * 1000).toFixed(0)} ms、輸出延遲 ${(state.outLatency * 1000).toFixed(0)} ms`);
 
   // 解調很吃 CPU，排在計時器裡分次做，避免卡住 UI；
@@ -3415,6 +3895,7 @@ async function startReceive() {
   state.timer = setInterval(() => {
     if (!state.rx) return;
     while (queue.length) rx.push(queue.shift());
+    scanForHello();
     sendAckIfDue(ctx, rx);
     renderProgress();
     if (rx.done) finishReceive();
@@ -3422,6 +3903,100 @@ async function startReceive() {
 
   $('recvStart').disabled = true;
   $('recvStop').disabled = false;
+}
+
+/** 交握期間持續在原始音訊裡找 HELLO；鎖定調變後就停 */
+function scanForHello() {
+  if (state.hsBusy || !state.hsWorker) return;
+  // 開始收到資料訊框就不必再找交握了
+  if (state.rx?.detectedMod) { state.hsSeen = true; state.hsBuf = []; state.hsTotal = 0; return; }
+  if (state.hsTotal < SR * 1.2) return;
+  const buf = new Float32Array(state.hsTotal);
+  let o = 0;
+  for (const c of state.hsBuf) { buf.set(c, o); o += c.length; }
+  // 記下這批音訊在全域時間軸的位置 —— READY 要排在對方的聽窗裡，
+  // 而那個窗的位置只能從 HELLO 訊框的結尾推回去
+  state.hsAnchor = { total: state.recorded, at: state.recordedAt, base: state.recorded - state.hsTotal };
+  state.hsBusy = true;
+  state.hsScans = (state.hsScans ?? 0) + 1;
+  state.hsWorker.postMessage(
+    { buf: buf.buffer, band: currentBand(), id: state.hsScans, mode: 'hello', marginDb: bitMargin() },
+    [buf.buffer]);
+}
+
+/**
+ * 把 READY 排進發送端的聽窗。
+ *
+ * 時序推導跟 ACK 同一套，只是基準換成 HELLO 訊框的結尾：交握時還沒有
+ * manifest，rx.lastFrameEnd 是空的，不能拿來當基準。
+ */
+function scheduleReady(ctx, helloIndex) {
+  const a = state.hsAnchor;
+  if (!a || !state.pendingReady) return;
+  // 一個交握週期最多送一次。
+  //
+  // 掃描每 250 ms 跑一次，而同一個 HELLO 會在滾動緩衝裡待上好幾秒 ——
+  // 不擋的話同一則回覆會被排 38 次，彼此重疊還撞上對方的 HELLO，
+  // 結果是「送了很多次、一次也沒被收到」。
+  if (state.readyUntil && ctx.currentTime < state.readyUntil) return;
+  const endGlobal = a.base + helloIndex + helloFrameSamples();
+  const tCapture = a.at - (a.total - endGlobal) / SR;
+  const cycle = helloFrameSamples() / SR + ACK_WINDOW_SEC;
+  let when = (tCapture - state.inLatency) + 0.05 - state.outLatency;
+  let lead = when - ctx.currentTime;
+  let hops = 0;
+  while (lead < 0.15 && hops < 6) { when += cycle; lead += cycle; hops++; }
+  if (lead < 0.15) return;
+
+  const samples = modulateReady(currentBand(), state.pendingReady);
+  const buf = ctx.createBuffer(1, samples.length, SR);
+  buf.copyToChannel(samples, 0);
+  const src = ctx.createBufferSource();
+  src.buffer = buf;
+  src.connect(state.ackGain);
+  src.start(ctx.currentTime + lead);
+  state.readySent = (state.readySent ?? 0) + 1;
+  state.readyUntil = ctx.currentTime + lead + samples.length / SR + 0.3;
+}
+
+/**
+ * 收到 HELLO：查出手上已經有哪幾段，連同量到的位元配置一起回報。
+ *
+ * 位元配置是這次交握的重點 —— 實測逐 bin 的 SNR 差到 13 dB，統一調變
+ * 等於全部遷就最差的那幾個副載波。由接收端來決定是因為要解調的是它，
+ * 而且量測資料也在它手上。
+ */
+async function onHello(found, store, index) {
+  const { hello, table, medianSnr } = found;
+  // 對方會重送 HELLO 直到收到回覆，所以每收到一次就回一次；
+  // 但查詢與記錄只做一次
+  if (state.pendingReady) { scheduleReady(state.ctx, index); return; }
+
+  const bits = unpackBitsTable(currentBand(), table);
+  state.rx?.addNegotiated(bits);
+  const total = bits.reduce((a, b) => a + b, 0);
+  log(`⇄ 收到交握：檔案 ${fmtBytes(hello.fileSize)}、${hello.segCount} 段` +
+    `　通道中位 SNR ${medianSnr === null ? '?' : medianSnr.toFixed(0)} dB` +
+    ` → 配置 ${total} bits/符元（${bits.filter((b) => b > 0).length}/${bits.length} 個副載波可用）`);
+
+  let have = [];
+  try {
+    // 先用 HELLO 的資訊建立檔案骨架 —— 否則 injectSegment 因為還沒有 file
+    // 而被靜默拒絕，續傳等於沒做
+    state.rx?.adoptFileInfo(hello);
+    state.fileKey = SegmentStore.fileKey(hello.hash8, hello.fileSize);
+    const saved = await store.load(state.fileKey);
+    // 注入交給 onFileKnown 那條路統一做（adoptFileInfo 會觸發它），
+    // 這裡只負責「告訴對方我有哪幾段」—— 兩邊都注入的話，
+    // 第二次會因為「已經有了」而回 false，段數就少算了
+    have = [...saved.keys()].filter((i) => i < hello.segCount);
+    if (have.length) log(`↻ 續傳：手上已有 ${have.length} 段，會請對方跳過`);
+  } catch (e) { log(`⚠ 查詢續傳進度失敗：${e.message}`); }
+
+  state.pendingReady = encodeReady({ band: currentBand(), hash8: hello.hash8, have, table });
+  globalThis.__wsPendingReady = [...state.pendingReady];   // 對測腳本會直接取用
+  state.readySent = 0;
+  scheduleReady(state.ctx, index);
 }
 
 /**
@@ -3627,9 +4202,16 @@ window.__wavesync = {
   // ACK 鏈路的隔離測試用。ACK 走的是反向 chirp、和資料訊框完全不同的路徑，
   // 混在整場傳輸裡除錯很難分清是「沒送出去」還是「送了但找不到」。
   modulateAck, findAck, encodeAck, ackFrameSamples, ACK_WINDOW_SEC,
+  modulateReady, encodeReady, modulateHello, encodeHello, helloFrameSamples, findReady, findHello,
+  // 對測用：繞過聲學反向鏈路，直接把一則 READY 交給發送端，
+  // 用來單獨驗證「跳過已收段」的邏輯
+  applyReady,
+  readyFrameSamples, helloPlan, readyChirp, helloChirp, decodeReady, READY_SYMBOLS, HELLO_SYMBOLS,
   findPreamble, reverseChirp, ackPlan, demodulate, decodeAck, ACK_SYMBOLS,
   snapshot: () => ({
     rx: state.rx ? { ...state.rx.stats(), acksSent: state.acksSent ?? 0, ackLead: state.lastAckLead,
+      hsScans: state.hsScans ?? 0, hsRatio: state.hsBestRatio ?? null, readySent: state.readySent ?? 0,
+      hsWhy: state.hsWhy ?? null,
       binSnr: state.rx.binSnr() } : null,
     tx: state.tx ? { ...state.tx.stats(), ackScans: state.ackScans ?? 0,
       ackReplies: state.ackReplies ?? 0, ackBusy: !!state.ackBusy,
@@ -3637,6 +4219,14 @@ window.__wavesync = {
       ackOffsetMs: state.ackOffsetMs ?? null, ackWindowMs: state.ackWindowMs ?? null,
       ackWhy: state.ackWhy ?? null,
       ackWindowsPending: state.ackWindows?.length ?? 0 } : null,
+    // 交握階段還沒有 tx，統計要獨立掛出來 —— 否則正好在最需要觀察的
+    // 那十幾秒裡什麼都看不到
+    hs: {
+      phase: state.hsPhase ?? null, helloTries: state.helloTries ?? 0,
+      scans: state.ackScans ?? 0, replies: state.ackReplies ?? 0,
+      ratio: state.bestAckRatio ?? null, why: state.ackWhy ?? null,
+      windows: state.ackWindows?.length ?? 0,
+    },
     gainDb: state.txGainDb ?? null,
   }),
 };

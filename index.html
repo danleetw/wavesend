@@ -102,7 +102,7 @@ h1 #ver { font-size: 13px; font-weight: 400; color: var(--muted); margin-left: 6
 
 </head>
 <body>
-<h1>wavesync <span id="ver">V26.0807 07:05</span></h1>
+<h1>wavesync <span id="ver">V26.0807 07:12</span></h1>
 <p class="sub">用聲音把檔案從一台裝置送到另一台。無網路、無配對、無伺服器。</p>
 
 <section class="card">
@@ -136,6 +136,12 @@ h1 #ver { font-size: 13px; font-weight: 400; color: var(--muted); margin-left: 6
   BPSK 的門檻比 QPSK 低 4.8 dB，但即使封包壞掉率到 25–40%，QPSK 因為每個符元多一倍
   位元，整體仍然比較快 —— 噴泉碼本來就是拿來吸收遺失的。實機對測（貼合 2–3 cm）：
   QPSK 約 180 B/s、BPSK 約 120 B/s。位置擺不好、SNR 掉到 8 dB 以下時才改用 BPSK。</p>
+  <p class="hint"><b>交握</b>：按下傳送後會先花幾秒跟接收端對一次話 ——
+  接收端量測每個副載波實際能承載幾個 bit（實測不同副載波差到 13 dB，統一調變等於
+  全部遷就最差的那幾個），順便回報它手上已經有哪幾段，發送端就能直接跳過。
+  談成的話速率大約是統一 QPSK 的 1.6 倍。<b>兩端的「交握」欄會顯示結果</b>；
+  談不成會自動退回上面選的調變，照樣能傳，只是慢一些。
+  交握的回覆走「手機喇叭 → 電腦麥克風」這個反方向，所以<b>手機喇叭那一端要朝著電腦的麥克風</b>。</p>
 </section>
 
 <section class="card">
@@ -3535,8 +3541,11 @@ async function startSend() {
     // 交握試夠次數還是沒回應就自己開始 —— 對方可能根本沒開麥克風，
     // 或反向鏈路不通。那不該讓傳送完全動不了。
     if (state.hsPhase === 'probing' && ctx.currentTime - state.hsStart > helloWait()) {
+      // 先把等待秒數記下來再標記失敗 —— 反過來的話這行永遠印縮短後的秒數
+      const waited = helloWait();
       handshakeEverFailed = true;
-      log(`⚠ 交握 ${helloWait().toFixed(1)} 秒沒有回應（送了 ${state.helloTries} 次），` +
+      state.hsOutcome = { ok: false, waited, tries: state.helloTries };
+      log(`⚠ 交握 ${waited.toFixed(1)} 秒沒有回應（送了 ${state.helloTries} 次），` +
         `改用手動選的 ${currentMod()}，速率會保守很多。`);
       log('  回報走的是「手機喇叭 → 電腦麥克風」這個反方向。收不到通常是：' +
         '手機沒開始接收、手機媒體音量太小、或手機的喇叭那一端被壓住／朝向桌面。');
@@ -3625,12 +3634,14 @@ function applyReady(ready) {
   // 擋不住「內容合法但不合理」，所以這一關要自己把。
   const MIN_BITS = 32;
   if (bits < MIN_BITS || used < table.length / 4) {
+    state.hsOutcome = { ok: false, tooWeak: true, bits, used, total: table.length };
     log(`⚠ 對方回報的通道配置太差（${bits} bits/符元、${used}/${table.length} 個副載波），` +
       `不採用，改用手動選的 ${currentMod()}。`);
     beginSending(currentMod(), ready.have);
     return;
   }
   handshakeEverFailed = false;
+  state.hsOutcome = { ok: true, bits, used, total: table.length, have: ready.have.length };
   log(`↩ 交握成功：對方量到的通道可載 ${bits} bits/符元` +
     `（${used}/${table.length} 個副載波可用）` +
     `${ready.have.length ? `，已有 ${ready.have.length} 段可跳過` : ''}`);
@@ -3649,6 +3660,30 @@ function beginSending(modOrTable, preAcked) {
     `${preAcked.length ? `，跳過 ${preAcked.length} 段` : ''}`);
   log(`每訊框 ${tx.packetsPerFrame} 封包 × ${tx.layout.payloadSize} B / ${tx.frameSec.toFixed(2)} s` +
     ` → 理論 ${tx.payloadBps.toFixed(0)} B/s`);
+}
+
+/**
+ * 交握結果做成常駐的一列。
+ *
+ * 原本只有兩行 log，幾秒就被後面的訊息蓋過去，畫面上再也找不到 ——
+ * 使用者根本看不出「有交握這件事」，更看不出它成功了沒有。
+ * 而談成與否直接決定速率差一倍以上，那是最該留在畫面上的資訊。
+ */
+function handshakeRow() {
+  const o = state.hsOutcome;
+  if (!o) return '';
+  if (o.ok) {
+    return `<div class="drow ok"><span>交握</span><b>已談成　` +
+      `逐副載波配置 ${o.bits} bits/符元（${o.used}/${o.total} 個可用）` +
+      `${o.have ? `　對方已有 ${o.have} 段，已跳過` : ''}</b></div>`;
+  }
+  if (o.tooWeak) {
+    return `<div class="drow warn"><span>交握</span><b>對方回報的通道太差` +
+      `（${o.bits} bits/符元），不採用，改用手動選的調變</b></div>`;
+  }
+  return `<div class="drow warn"><span>交握</span><b>未談成` +
+    `（等了 ${o.waited?.toFixed(1)} 秒、送了 ${o.tries} 次）—— ` +
+    `改用手動選的調變。手機喇叭那一端要朝向電腦麥克風</b></div>`;
 }
 
 function renderHandshake(ctx) {
@@ -3678,6 +3713,7 @@ function renderTx(tx) {
   // 輸出增益直接顯示出來 —— 接收端 SNR 偏低時，第一個要確認的就是它，
   // 而它是唯一「設定了但看不見」的東西。
   $('txProgress').innerHTML =
+    handshakeRow() +
     `<div class="drow ${state.txGainDb <= -12 ? 'warn' : 'info'}"><span>設定</span><b>` +
     `${currentBand()} / ${currentMod()} / 輸出 ${state.txGainDb} dB` +
     `${state.txGainDb <= -12 ? '（很低，接收端 SNR 會不足）' : ''}</b></div>` +
@@ -3785,6 +3821,8 @@ function resetReceiveUi() {
   $('rxLevel').textContent = '';
   $('meterBar').style.width = '0';
   $('meterText').textContent = '等待訊號…';
+  state.rxHs = null;
+  state.hsOutcome = null;
 }
 
 async function startReceive() {
@@ -3986,6 +4024,7 @@ async function onHello(found, store, index) {
   const bits = unpackBitsTable(currentBand(), table);
   state.rx?.addNegotiated(bits);
   const total = bits.reduce((a, b) => a + b, 0);
+  state.rxHs = { bits: total, used: bits.filter((b) => b > 0).length, total: bits.length, have: 0 };
   log(`⇄ 收到交握：檔案 ${fmtBytes(hello.fileSize)}、${hello.segCount} 段` +
     `　通道中位 SNR ${medianSnr === null ? '?' : medianSnr.toFixed(0)} dB` +
     ` → 配置 ${total} bits/符元（${bits.filter((b) => b > 0).length}/${bits.length} 個副載波可用）`);
@@ -4001,6 +4040,7 @@ async function onHello(found, store, index) {
     // 這裡只負責「告訴對方我有哪幾段」—— 兩邊都注入的話，
     // 第二次會因為「已經有了」而回 false，段數就少算了
     have = [...saved.keys()].filter((i) => i < hello.segCount);
+    if (state.rxHs) state.rxHs.have = have.length;
     if (have.length) log(`↻ 續傳：手上已有 ${have.length} 段，會請對方跳過`);
   } catch (e) { log(`⚠ 查詢續傳進度失敗：${e.message}`); }
 
@@ -4073,6 +4113,12 @@ function renderProgress() {
   const el = $('rxProgress');
 
   // chirp 有沒有被抓到，是解不開時第一個要看的東西 —— 所以永遠顯示
+  const hsRow = state.rxHs
+    ? `<div class="drow ok"><span>交握</span><b>已回報通道狀況：` +
+      `${state.rxHs.bits} bits/符元（${state.rxHs.used}/${state.rxHs.total} 個副載波可用）` +
+      `${state.rxHs.have ? `，並告知已有 ${state.rxHs.have} 段` : ''}</b></div>`
+    : `<div class="drow info"><span>交握</span><b>還沒收到發送端的交握訊框</b></div>`;
+
   const syncRow =
     `<div class="drow ${st.framesSeen ? 'ok' : 'bad'}"><span>同步</span><b>` +
     (st.framesSeen
@@ -4084,7 +4130,7 @@ function renderProgress() {
     // 沒有 manifest 時也要顯示封包統計 —— 少了它就分不出
     // 「訊框解得開但 manifest 剛好都壞掉」和「封包全壞」，
     // 而這兩者的處理方式完全不同。
-    el.innerHTML = syncRow +
+    el.innerHTML = hsRow + syncRow +
       `<div class="drow info"><span>狀態</span><b>` +
       (st.framesSeen ? '已鎖定但還沒收到檔案資訊…' : '找不到前導訊號') +
       `（已聽 ${fmtSec(secs)}）</b></div>` +
